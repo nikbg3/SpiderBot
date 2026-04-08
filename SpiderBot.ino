@@ -5,7 +5,6 @@
 #include "spiderbot_motion.h"
 #include "webserver.h"
 
-// IR receiver pin differs between the ESP32-C3 test target and the ESP8266 robot board.
 #ifdef ARDUINO_ESP32C3_DEV
 const uint16_t kRecvPin = 10;
 #else
