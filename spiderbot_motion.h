@@ -43,6 +43,8 @@ public:
 
     void init();
     void calibration();
+    void SetMotionDelay(int delayMs);
+    int GetMotionDelay() const;
 };
 
 #endif

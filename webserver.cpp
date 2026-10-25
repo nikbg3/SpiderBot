@@ -1,4 +1,5 @@
 #include <EEPROM.h>
+#include <string.h>
 #include "webserver.h"
 
 const char* password = "12345678";
@@ -21,6 +22,10 @@ static bool g_robotBusy = false;
 static bool g_stopRequested = false;
 static int g_stopTargetProgram = PROGRAM_STANDBY;
 static bool g_debugUiEnabled = false;
+static bool g_wifiApReady = false;
+static NavigationTelemetry g_navigationTelemetry = {
+    "INITIALIZING", -1.0f, 0.0f, 0.0f, 0, 0, false, {0}
+};
 
 static const RobotActionInfo kRobotActions[] = {
     {PROGRAM_STANDBY, "standby", "待机"},
@@ -88,6 +93,15 @@ input[type=number]{width:68px;padding:6px 4px;border-radius:8px;border:1px solid
 .set-btn{border:none;border-radius:8px;background:#14532d;color:#dcfce7;padding:7px 10px;font-size:.8rem;font-weight:700;cursor:pointer}
 .wide-btn{width:100%;margin-top:12px;padding:11px;border:none;border-radius:10px;background:#1d4ed8;color:#eff6ff;font-size:.9rem;font-weight:700;cursor:pointer}
 .hint{font-size:.78rem;color:#94a3b8;margin-top:8px}
+.nav-grid{display:grid;grid-template-columns:minmax(240px,360px) minmax(180px,1fr);gap:16px;align-items:center}
+.nav-map{display:block;width:100%;height:auto;aspect-ratio:1;background:#24313f;border:1px solid #475569;border-radius:8px;image-rendering:pixelated}
+.nav-stats{font-size:.82rem;line-height:1.8;color:#cbd5e1}
+.nav-state{font-size:1rem;font-weight:700;color:#86efac}
+.nav-note{font-size:.72rem;color:#94a3b8;margin-top:6px}
+.nav-legend{display:flex;flex-wrap:wrap;gap:8px 14px;margin-top:10px;font-size:.75rem;color:#cbd5e1}
+.nav-legend-item{display:flex;align-items:center;gap:5px}
+.nav-swatch{width:12px;height:12px;border:1px solid #64748b;border-radius:2px}
+@media(max-width:640px){.nav-grid{grid-template-columns:1fr}.nav-map{width:min(100%,360px);margin:auto}}
 </style>
 </head>
 <body>
@@ -101,6 +115,29 @@ input[type=number]{width:68px;padding:6px 4px;border-radius:8px;border:1px solid
   </div>
 
   <div class="main">
+    <div class="panel">
+      <div class="panel-title">Navigation</div>
+      <div class="nav-grid">
+        <canvas id="navMap" class="nav-map" width="360" height="360" aria-label="Estimated occupancy and robot path map"></canvas>
+        <div class="nav-stats">
+          <div class="nav-state" id="navState">Waiting for telemetry</div>
+          <div>Front range: <span id="navRange">--</span></div>
+          <div>Travel estimate: <span id="navTravel">0</span> cm</div>
+          <div>Area covered (map): <span id="navArea">0.00</span> m&sup2;</div>
+          <div>Heading estimate: <span id="navHeading">0</span>&deg;</div>
+          <div>Recovery attempts: <span id="navRecovery">0</span></div>
+        </div>
+      </div>
+      <div class="nav-legend">
+        <span class="nav-legend-item"><i class="nav-swatch" style="background:#24313f"></i>Unknown</span>
+        <span class="nav-legend-item"><i class="nav-swatch" style="background:#62b6be"></i>Observed clear</span>
+        <span class="nav-legend-item"><i class="nav-swatch" style="background:#111827"></i>Obstacle</span>
+        <span class="nav-legend-item"><i class="nav-swatch" style="background:#f8fafc"></i>Estimated path</span>
+        <span class="nav-legend-item"><i class="nav-swatch" style="background:#4f46e5"></i>Robot</span>
+      </div>
+      <div class="nav-note">Area is the known cells in the current map window (10 cm per cell); the map recenters as the robot moves. Position and path are estimated from gait commands (no odometry).</div>
+    </div>
+
     <div class="panel">
       <div class="panel-title">Directional Control</div>
       <div class="grid grid3">
@@ -174,6 +211,67 @@ function save(id){
   fetch('/save?key=' + id + '&value=' + value, { cache: 'no-store' });
 }
 function hideDebug(){ window.location = '/debug/close'; }
+function drawNavMap(grid, heading){
+  var canvas = document.getElementById('navMap');
+  var ctx = canvas.getContext('2d');
+  var width = 31;
+  if(typeof grid !== 'string' || grid.length !== width * width) return;
+  var cellSize = canvas.width / width;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for(var y = 0; y < width; y++){
+    for(var x = 0; x < width; x++){
+      var cell = grid.charAt(y * width + x);
+      var left = x * cellSize;
+      var top = y * cellSize;
+      ctx.fillStyle = cell === '#' ? '#111827' :
+        cell === '+' ? '#f8fafc' :
+        cell === 'R' ? '#4f46e5' :
+        cell === '.' ? '#62b6be' : '#24313f';
+      ctx.fillRect(left, top, cellSize, cellSize);
+      if(cell === '?'){
+        ctx.fillStyle = '#526174';
+        ctx.fillRect(left + cellSize * 0.44, top + cellSize * 0.44, 2, 2);
+      }
+    }
+  }
+  ctx.strokeStyle = 'rgba(148,163,184,.28)';
+  ctx.lineWidth = 1;
+  for(var line = 0; line <= width; line++){
+    var p = line * cellSize;
+    ctx.beginPath(); ctx.moveTo(p, 0); ctx.lineTo(p, canvas.height); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, p); ctx.lineTo(canvas.width, p); ctx.stroke();
+  }
+  var robotIndex = grid.indexOf('R');
+  if(robotIndex >= 0){
+    var robotX = (robotIndex % width + 0.5) * cellSize;
+    var robotY = (Math.floor(robotIndex / width) + 0.5) * cellSize;
+    var facing = (heading - 90) * Math.PI / 180;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(robotX, robotY);
+    ctx.lineTo(robotX + Math.cos(facing) * cellSize * 0.8, robotY + Math.sin(facing) * cellSize * 0.8);
+    ctx.stroke();
+  }
+}
+function updateNavigation(){
+  fetch('/api/v1/navigation', { cache: 'no-store' })
+    .then(function(response){ if(!response.ok) throw new Error('status'); return response.json(); })
+    .then(function(response){
+      if(!response.ok || !response.data) return;
+      var nav = response.data;
+      document.getElementById('navState').textContent = nav.state;
+      document.getElementById('navRange').textContent = nav.sensor_valid ? nav.distance_cm + ' cm' : 'unavailable';
+      document.getElementById('navTravel').textContent = nav.distance_travelled_cm;
+      document.getElementById('navArea').textContent = Number(nav.area_covered_m2).toFixed(2);
+      document.getElementById('navHeading').textContent = nav.heading_deg;
+      document.getElementById('navRecovery').textContent = nav.recovery_attempts;
+      drawNavMap(nav.grid, nav.heading_deg);
+    })
+    .catch(function(){ document.getElementById('navState').textContent = 'Telemetry unavailable'; });
+}
+updateNavigation();
+window.setInterval(updateNavigation, 1500);
 function openCal(){
   fetch('/setting1', { cache: 'no-store' })
     .then(function(r){ return r.json(); })
@@ -328,6 +426,25 @@ int getRobotStopTargetProgram()
     return g_stopTargetProgram;
 }
 
+void publishNavigationTelemetry(const char* state, float distanceCm,
+    float distanceTravelledCm, float areaCoveredM2, int headingDegrees, int recoveryAttempts,
+    bool sensorValid, const uint16_t scanDistancesCm[12],
+    const uint8_t occupancyGrid[31 * 31])
+{
+    strncpy(g_navigationTelemetry.state, state, sizeof(g_navigationTelemetry.state) - 1);
+    g_navigationTelemetry.state[sizeof(g_navigationTelemetry.state) - 1] = '\0';
+    g_navigationTelemetry.distanceCm = distanceCm;
+    g_navigationTelemetry.distanceTravelledCm = distanceTravelledCm;
+    g_navigationTelemetry.areaCoveredM2 = areaCoveredM2;
+    g_navigationTelemetry.headingDegrees = headingDegrees;
+    g_navigationTelemetry.recoveryAttempts = recoveryAttempts;
+    g_navigationTelemetry.sensorValid = sensorValid;
+    memcpy(g_navigationTelemetry.scanDistancesCm, scanDistancesCm,
+        sizeof(g_navigationTelemetry.scanDistancesCm));
+    memcpy(g_navigationTelemetry.occupancyGrid, occupancyGrid,
+        sizeof(g_navigationTelemetry.occupancyGrid));
+}
+
 static bool ensureDebugUiEnabled()
 {
     if (g_debugUiEnabled) {
@@ -341,6 +458,7 @@ static bool ensureDebugUiEnabled()
 static void sendJsonResponse(int statusCode, bool ok, int code, const char* message, const String& data)
 {
     String payload = "{\"ok\":";
+    payload.reserve(data.length() + 96);
     payload += ok ? "true" : "false";
     payload += ",\"code\":";
     payload += String(code);
@@ -615,7 +733,7 @@ static bool resolveStopMode(int& targetProgram)
 
 // ── WiFi / EEPROM init ────────────────────────────────────────────────────────
 
-void webinit()
+bool webinit()
 {
     uint8_t mac[WL_MAC_ADDR_LENGTH];
     WiFi.softAPmacAddress(mac);
@@ -629,10 +747,12 @@ void webinit()
     for (int i = 0; i < (int)AP_NameString.length(); i++)
         AP_NameChar[i] = AP_NameString.charAt(i);
 
-    WiFi.softAP(AP_NameChar, password);
+    WiFi.mode(WIFI_AP);
+    g_wifiApReady = WiFi.softAP(AP_NameChar, password);
 
     EEPROM.begin(512);
     delay(10);
+    return g_wifiApReady;
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
@@ -716,8 +836,46 @@ static void handleApiState()
     data += getActionName(getRobotStopTargetProgram());
     data += "\",\"debug_ui_enabled\":";
     data += g_debugUiEnabled ? "true" : "false";
+    data += ",\"wifi_ap_ready\":";
+    data += g_wifiApReady ? "true" : "false";
     data += ",\"wifi_mode\":\"AP\"}";
 
+    sendJsonResponse(200, true, 0, "OK", data);
+}
+
+static void handleApiNavigation()
+{
+    String data;
+    data.reserve(1450);
+    data = "{";
+    data += "\"state\":\"";
+    data += g_navigationTelemetry.state;
+    data += "\",\"sensor_valid\":";
+    data += g_navigationTelemetry.sensorValid ? "true" : "false";
+    data += ",\"distance_cm\":";
+    data += String(g_navigationTelemetry.distanceCm, 1);
+    data += ",\"distance_travelled_cm\":";
+    data += String(g_navigationTelemetry.distanceTravelledCm, 1);
+    data += ",\"area_covered_m2\":";
+    data += String(g_navigationTelemetry.areaCoveredM2, 2);
+    data += ",\"heading_deg\":";
+    data += String(g_navigationTelemetry.headingDegrees);
+    data += ",\"recovery_attempts\":";
+    data += String(g_navigationTelemetry.recoveryAttempts);
+    data += ",\"scan_cm\":[";
+    for (int i = 0; i < 12; ++i) {
+        if (i > 0) {
+            data += ",";
+        }
+        data += String(g_navigationTelemetry.scanDistancesCm[i]);
+    }
+    data += "],\"map_width\":31,\"map_height\":31,\"cell_size_cm\":10,\"grid\":\"";
+    static const char kMapCellSymbols[] = {'?', '.', '#', '+', 'R'};
+    for (size_t i = 0; i < sizeof(g_navigationTelemetry.occupancyGrid); ++i) {
+        const uint8_t cell = g_navigationTelemetry.occupancyGrid[i];
+        data += cell < sizeof(kMapCellSymbols) ? kMapCellSymbols[cell] : '?';
+    }
+    data += "\"}";
     sendJsonResponse(200, true, 0, "OK", data);
 }
 
@@ -902,6 +1060,7 @@ void enableWebServer()
     server.on("/setting1",   HTTP_GET, handleSetting1);
     server.on("/api/v1/info",        HTTP_GET, handleApiInfo);
     server.on("/api/v1/state",       HTTP_GET, handleApiState);
+    server.on("/api/v1/navigation", HTTP_GET, handleApiNavigation);
     server.on("/api/v1/action",      HTTP_POST, handleApiAction);
     server.on("/api/v1/calibration", HTTP_GET, handleApiCalibrationGet);
     server.on("/api/v1/calibration", HTTP_POST, handleApiCalibrationPost);

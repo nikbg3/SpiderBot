@@ -38,12 +38,24 @@ struct RobotDeviceInfo {
     const char* protocolVersion;
 };
 
+struct NavigationTelemetry {
+    char state[24];
+    float distanceCm;
+    float distanceTravelledCm;
+    float areaCoveredM2;
+    int headingDegrees;
+    int recoveryAttempts;
+    bool sensorValid;
+    uint16_t scanDistancesCm[12];
+    uint8_t occupancyGrid[31 * 31];
+};
+
 extern int Servo_PROGRAM;
 extern int GPIO_ID;
 extern String ival;
 extern const RobotDeviceInfo kRobotDeviceInfo;
 
-void webinit();
+bool webinit();
 void enableWebServer();
 void handleClient();
 
@@ -64,5 +76,9 @@ void requestRobotStop(int targetProgram);
 void clearRobotStopRequest();
 bool isRobotStopRequested();
 int getRobotStopTargetProgram();
+void publishNavigationTelemetry(const char* state, float distanceCm,
+    float distanceTravelledCm, float areaCoveredM2, int headingDegrees, int recoveryAttempts,
+    bool sensorValid, const uint16_t scanDistancesCm[12],
+    const uint8_t occupancyGrid[31 * 31]);
 
 #endif

@@ -14,8 +14,19 @@
 // Cached servo state for interpolated motion playback.
 int Running_Servo_POS[ALLMATRIX];
 
-// Base interpolation interval in milliseconds.
-int BASEDELAYTIME = 10;
+// Shorten each motion keyframe and update servo targets more frequently.
+static const int MOTION_TIME_SCALE_PERCENT = 60;
+int BASEDELAYTIME = 5;
+
+void SpiderBotMotion::SetMotionDelay(int delayMs)
+{
+    BASEDELAYTIME = constrain(delayMs, 3, 25);
+}
+
+int SpiderBotMotion::GetMotionDelay() const
+{
+    return BASEDELAYTIME;
+}
 
 void SpiderBotMotion::Servo_PROGRAM_Zero()
 {
@@ -71,7 +82,8 @@ void SpiderBotMotion::Servo_PROGRAM_Run(const int iMatrix[][ALLMATRIX], int iSte
             return;
         }
 
-        int InterTotalTime = iMatrix[MainLoopIndex][ALLMATRIX - 1];
+        int InterTotalTime =
+            iMatrix[MainLoopIndex][ALLMATRIX - 1] * MOTION_TIME_SCALE_PERCENT / 100;
         int InterDelayCounter = InterTotalTime / BASEDELAYTIME;
 
         for (int InterStepLoop = 0; InterStepLoop < InterDelayCounter; InterStepLoop++) {
