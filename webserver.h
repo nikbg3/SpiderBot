@@ -40,15 +40,40 @@ struct RobotDeviceInfo {
 
 struct NavigationTelemetry {
     char state[24];
+    char reason[96];
     float distanceCm;
     float distanceTravelledCm;
     float areaCoveredM2;
-    int headingDegrees;
+    float headingDegrees;
+    int mapOffsetX;
+    int mapOffsetY;
     int recoveryAttempts;
     bool sensorValid;
     uint16_t scanDistancesCm[12];
     uint8_t occupancyGrid[31 * 31];
 };
+
+enum NavigationControl {
+    NAV_CONTROL_NONE,
+    NAV_CONTROL_PAUSE,
+    NAV_CONTROL_RESUME,
+    NAV_CONTROL_RESTART
+};
+
+struct NavigationWaypoint {
+    float xCm;
+    float yCm;
+    int16_t animationId;
+};
+
+enum NavigationTargetKind {
+    NAV_TARGET_NONE,
+    NAV_TARGET_POINT,
+    NAV_TARGET_ROUTE,
+    NAV_TARGET_HOME
+};
+
+static const uint8_t MAX_NAVIGATION_WAYPOINTS = 12;
 
 extern int Servo_PROGRAM;
 extern int GPIO_ID;
@@ -61,6 +86,11 @@ void handleClient();
 
 void writeKeyValue(int8_t key, int8_t value);
 int8_t readKeyValue(int8_t key);
+int8_t getForwardSteeringCorrection();
+bool setForwardSteeringCorrection(int degreesPerMeter);
+uint16_t getObserved360RotationDegrees();
+bool setObserved360RotationDegrees(uint16_t observed360);
+float getRotationCalibrationScale();
 const RobotActionInfo* getRobotActions(size_t& count);
 const RobotActionInfo* findRobotActionById(int actionId);
 const RobotActionInfo* findRobotActionByName(const String& actionName);
@@ -76,8 +106,18 @@ void requestRobotStop(int targetProgram);
 void clearRobotStopRequest();
 bool isRobotStopRequested();
 int getRobotStopTargetProgram();
-void publishNavigationTelemetry(const char* state, float distanceCm,
-    float distanceTravelledCm, float areaCoveredM2, int headingDegrees, int recoveryAttempts,
+bool queueNavigationControl(NavigationControl control);
+NavigationControl takeNavigationControl();
+bool hasNavigationControlPending();
+bool queueNavigationTarget(NavigationTargetKind kind,
+    const NavigationWaypoint* waypoints, uint8_t count);
+NavigationTargetKind takeNavigationTarget(NavigationWaypoint* waypoints,
+    uint8_t& count);
+bool hasNavigationTargetPending();
+void publishNavigationTelemetry(const char* state, const char* reason,
+    float distanceCm,
+    float distanceTravelledCm, float areaCoveredM2, float headingDegrees,
+    int mapOffsetX, int mapOffsetY, int recoveryAttempts,
     bool sensorValid, const uint16_t scanDistancesCm[12],
     const uint8_t occupancyGrid[31 * 31]);
 

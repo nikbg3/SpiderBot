@@ -1,4 +1,6 @@
 #include <EEPROM.h>
+#include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include "webserver.h"
 
@@ -21,10 +23,15 @@ static int g_currentActionId = PROGRAM_NONE;
 static bool g_robotBusy = false;
 static bool g_stopRequested = false;
 static int g_stopTargetProgram = PROGRAM_STANDBY;
+static volatile NavigationControl g_navigationControl = NAV_CONTROL_NONE;
+static NavigationTargetKind g_navigationTargetKind = NAV_TARGET_NONE;
+static NavigationWaypoint g_navigationWaypoints[MAX_NAVIGATION_WAYPOINTS];
+static uint8_t g_navigationWaypointCount = 0;
 static bool g_debugUiEnabled = false;
 static bool g_wifiApReady = false;
 static NavigationTelemetry g_navigationTelemetry = {
-    "INITIALIZING", -1.0f, 0.0f, 0.0f, 0, 0, false, {0}
+    "INITIALIZING", "Starting up", -1.0f, 0.0f, 0.0f, 0, -15, -15, 0,
+    false, {0}, {0}
 };
 
 static const RobotActionInfo kRobotActions[] = {
@@ -91,17 +98,41 @@ th{color:#9ca3af;font-weight:600}
 .group td{padding-top:12px;padding-bottom:6px;text-align:left;color:#93c5fd;font-size:.78rem;font-weight:700;border-bottom:none}
 input[type=number]{width:68px;padding:6px 4px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#f8fafc;text-align:center}
 .set-btn{border:none;border-radius:8px;background:#14532d;color:#dcfce7;padding:7px 10px;font-size:.8rem;font-weight:700;cursor:pointer}
+.steering-calibration{display:flex;align-items:center;gap:10px;margin-top:10px}
+.steering-calibration label{flex:1;font-size:.82rem;color:#cbd5e1}
 .wide-btn{width:100%;margin-top:12px;padding:11px;border:none;border-radius:10px;background:#1d4ed8;color:#eff6ff;font-size:.9rem;font-weight:700;cursor:pointer}
 .hint{font-size:.78rem;color:#94a3b8;margin-top:8px}
 .nav-grid{display:grid;grid-template-columns:minmax(240px,360px) minmax(180px,1fr);gap:16px;align-items:center}
 .nav-map{display:block;width:100%;height:auto;aspect-ratio:1;background:#24313f;border:1px solid #475569;border-radius:8px;image-rendering:pixelated}
 .nav-stats{font-size:.82rem;line-height:1.8;color:#cbd5e1}
 .nav-state{font-size:1rem;font-weight:700;color:#86efac}
+.nav-notice{display:none;margin:8px 0;padding:9px 11px;border:1px solid #2563eb;border-radius:9px;background:#172554;color:#dbeafe;font-size:.84rem;line-height:1.4}
+.nav-notice.show{display:block}
+.nav-notice.error{border-color:#b91c1c;background:#450a0a;color:#fee2e2}
 .nav-note{font-size:.72rem;color:#94a3b8;margin-top:6px}
 .nav-legend{display:flex;flex-wrap:wrap;gap:8px 14px;margin-top:10px;font-size:.75rem;color:#cbd5e1}
 .nav-legend-item{display:flex;align-items:center;gap:5px}
 .nav-swatch{width:12px;height:12px;border:1px solid #64748b;border-radius:2px}
-@media(max-width:640px){.nav-grid{grid-template-columns:1fr}.nav-map{width:min(100%,360px);margin:auto}}
+.nav-actions{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+.nav-action-btn{border:0;border-radius:9px;padding:9px 12px;background:#1d4ed8;color:#eff6ff;font-size:.82rem;font-weight:700;cursor:pointer;touch-action:manipulation}
+.nav-action-btn.alt{background:#374151}
+.nav-grid-host{width:100%}
+.map-wrap{position:relative;min-width:0}
+.map-fullscreen{position:fixed;inset:0;z-index:40;display:none;background:#0b1120;padding:max(12px,env(safe-area-inset-top)) 14px max(12px,env(safe-area-inset-bottom));overflow:auto}
+.map-fullscreen.show{display:flex;flex-direction:column}
+.map-fullscreen-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:12px}
+.map-fullscreen-title{font-size:1rem;font-weight:700;color:#93c5fd}
+.map-fullscreen .nav-grid{flex:1;grid-template-columns:minmax(0,1fr) minmax(200px,260px);align-content:center}
+.map-fullscreen .nav-map{width:min(100%,calc(100vh - 50px));max-height:calc(100vh - 92px);margin:auto}
+.map-fullscreen .nav-stats{font-size:1rem;line-height:2}
+.map-context{position:fixed;z-index:50;display:none;min-width:170px;padding:6px;background:#111827;border:1px solid #475569;border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.5)}
+.map-context.show{display:grid;gap:4px}
+.map-context button{border:0;border-radius:7px;padding:10px;text-align:left;background:#1f2937;color:#f8fafc;font-size:.84rem;font-weight:700;cursor:pointer}
+.map-context button:hover{background:#1d4ed8}
+.map-context button:disabled{opacity:.45}
+.map-context{max-height:80vh;overflow-y:auto}
+#mapAnimationOptions{display:grid;gap:4px}
+@media(max-width:640px){.nav-grid{grid-template-columns:1fr}.nav-map{width:min(100%,360px);margin:auto}.map-fullscreen .nav-grid{grid-template-columns:1fr}.map-fullscreen .nav-map{width:min(100%,calc(100vw - 28px),calc(100vh - 230px));max-height:none}.map-fullscreen .nav-stats{display:grid;grid-template-columns:1fr 1fr;gap:0 10px;font-size:.86rem;line-height:1.7}}
 </style>
 </head>
 <body>
@@ -117,25 +148,37 @@ input[type=number]{width:68px;padding:6px 4px;border-radius:8px;border:1px solid
   <div class="main">
     <div class="panel">
       <div class="panel-title">Navigation</div>
-      <div class="nav-grid">
-        <canvas id="navMap" class="nav-map" width="360" height="360" aria-label="Estimated occupancy and robot path map"></canvas>
-        <div class="nav-stats">
+      <div class="nav-actions">
+        <button class="nav-action-btn" onclick="controlNavigation('resume')">Resume</button>
+        <button class="nav-action-btn alt" onclick="controlNavigation('restart')">Restart autonomy</button>
+        <button class="nav-action-btn alt" onclick="openMapFullscreen()">Full screen map</button>
+        <button class="nav-action-btn alt" id="voiceToggle" onclick="toggleNavigationVoice()" aria-pressed="false">Mute voice</button>
+      </div>
+      <div id="navNotice" class="nav-notice" role="status" aria-live="polite"></div>
+      <div id="navGridHost" class="nav-grid-host">
+        <div class="nav-grid" id="navGrid">
+          <div class="map-wrap">
+            <canvas id="navMap" class="nav-map" width="360" height="360" aria-label="Occupancy grid showing robot position, orientation, and home position"></canvas>
+          </div>
+          <div class="nav-stats">
           <div class="nav-state" id="navState">Waiting for telemetry</div>
           <div>Front range: <span id="navRange">--</span></div>
-          <div>Travel estimate: <span id="navTravel">0</span> cm</div>
+          <div>Distance travelled: <span id="navTravel">0</span> cm</div>
           <div>Area covered (map): <span id="navArea">0.00</span> m&sup2;</div>
-          <div>Heading estimate: <span id="navHeading">0</span>&deg;</div>
+          <div>Heading: <span id="navHeading">0</span>&deg;</div>
           <div>Recovery attempts: <span id="navRecovery">0</span></div>
+          </div>
         </div>
       </div>
       <div class="nav-legend">
         <span class="nav-legend-item"><i class="nav-swatch" style="background:#24313f"></i>Unknown</span>
         <span class="nav-legend-item"><i class="nav-swatch" style="background:#62b6be"></i>Observed clear</span>
         <span class="nav-legend-item"><i class="nav-swatch" style="background:#111827"></i>Obstacle</span>
-        <span class="nav-legend-item"><i class="nav-swatch" style="background:#f8fafc"></i>Estimated path</span>
+        <span class="nav-legend-item"><i class="nav-swatch" style="background:#f8fafc"></i>Robot path</span>
         <span class="nav-legend-item"><i class="nav-swatch" style="background:#4f46e5"></i>Robot</span>
+        <span class="nav-legend-item"><i class="nav-swatch" style="background:#22c55e"></i>Home</span>
       </div>
-      <div class="nav-note">Area is the known cells in the current map window (10 cm per cell); the map recenters as the robot moves. Position and path are estimated from gait commands (no odometry).</div>
+      <div class="nav-note">Right-click the map (or long-press on touch) for Go here, animations, routes, pause/resume, and Return to home. Route points can be added with an animation; the robot plays it and continues, pausing at the final point. A single animated destination resumes coverage after the animation. Coverage uses 8 cm forward steps and 18.70&deg; turns, with a scaled final gait for exact 90&deg;, 180&deg;, and 360&deg; rotations. Map targets stay anchored as the map recenters.</div>
     </div>
 
     <div class="panel">
@@ -196,22 +239,203 @@ input[type=number]{width:68px;padding:6px 4px;border-radius:8px;border:1px solid
           <tr><td>D2</td><td>Foot</td><td>Swing</td><td><input type="number" id="s7" min="-30" max="30" value="0"></td><td><button class="set-btn" onclick="save(7)">SET</button></td></tr>
         </tbody>
       </table>
+      <div class="panel-title">Forward steering correction</div>
+      <p class="hint">Positive values counter left drift; negative values counter right drift. Enter degrees of drift per meter. For a 45&deg; left drift over 1.5 m, start at +30&deg;/m. Saved settings persist and apply on the next forward gait.</p>
+      <div class="steering-calibration">
+        <label for="steeringCorrection">Drift (degrees per meter)</label>
+        <input type="number" id="steeringCorrection" min="-90" max="90" step="1" value="30">
+        <button class="set-btn" onclick="saveSteeringCorrection()">SET</button>
+      </div>
+      <div class="panel-title">Turn calibration</div>
+      <p class="hint">Enter the measured angle after commanding one full 360&deg; turn. This single scale calibrates turns of every requested size, including manual turns, navigation, fractional turns, and scans.</p>
+      <div class="steering-calibration">
+        <label for="rotation360Observed">Observed after 360&deg; command</label>
+        <input type="number" id="rotation360Observed" min="300" max="420" step="1" value="360">
+        <span>deg</span>
+      </div>
+      <button class="wide-btn" onclick="saveRotationCalibration()">Save universal turn calibration</button>
       <button class="wide-btn" onclick="pm(100)">Go To Zero Pose</button>
       <div class="hint">Offset range: -30 to +30 is recommended for quick calibration.</div>
     </div>
   </div>
 </div>
 
+<div id="mapFullscreen" class="map-fullscreen" aria-label="Full screen robot map">
+  <div class="map-fullscreen-head">
+    <div class="map-fullscreen-title">Robot map and navigation</div>
+    <button class="tool-btn alt" onclick="closeMapFullscreen()">Close map</button>
+  </div>
+  <div id="fullscreenMapSlot"></div>
+</div>
+<div id="mapContextMenu" class="map-context" role="menu">
+  <button id="mapGoButton" onclick="mapMenuAction('goto')">Go here</button>
+  <button id="mapRouteButton" onclick="mapMenuAction('route')">Draw route</button>
+  <button id="mapAddRoutePointButton" onclick="mapMenuAction('add-route-point')">Add route point</button>
+  <div id="mapAnimationOptions"></div>
+  <button id="mapPauseButton" onclick="mapMenuAction('pause')">Pause</button>
+  <button onclick="mapMenuAction('home')">Return to home</button>
+  <button id="mapCancelRouteButton" onclick="mapMenuAction('cancel')">Cancel route</button>
+</div>
+
 <script>
-function pm(v){ fetch('/controller?pm=' + v, { cache: 'no-store' }); }
+var latestNavigation = null;
+var selectedMapPoint = null;
+var plannedRoute = [];
+var drawingRoute = false;
+var mapAnimations = [
+  {id:9,name:'Hello'}, {id:11,name:'Push Up'}, {id:8,name:'Lie'},
+  {id:10,name:'Fighting / Attack'}, {id:12,name:'Sleep'},
+  {id:13,name:'Dance 1'}, {id:14,name:'Dance 2'}, {id:15,name:'Dance 3'}
+];
+var longPressTimer = 0;
+var ignoreNextMapClick = false;
+var lastSpokenNavigationUpdate = null;
+var navigationVoiceMuted = false;
+try {
+  navigationVoiceMuted = localStorage.getItem('navigationVoiceMuted') === 'true';
+} catch (error) {}
+function showNavigationNotice(message, isError){
+  var notice = document.getElementById('navNotice');
+  notice.textContent = message;
+  notice.className = 'nav-notice show' + (isError ? ' error' : '');
+}
+function pm(v){
+  fetch('/controller?pm=' + v, { cache: 'no-store' })
+    .then(function(response){
+      if(!response.ok) throw new Error('Command rejected by robot');
+      showNavigationNotice('Command accepted');
+    })
+    .catch(function(error){ showNavigationNotice(error.message, true); });
+}
+function controlNavigation(command){
+  fetch('/api/v1/navigation/control?command=' + encodeURIComponent(command), { method: 'POST', cache: 'no-store' })
+    .then(function(response){ return response.json(); })
+    .then(function(response){
+      if(!response.ok) throw new Error(response.message || 'Navigation command failed');
+      showNavigationNotice(response.message || 'Navigation command accepted');
+      updateNavigation();
+    })
+    .catch(function(error){
+      showNavigationNotice(error.message || 'Navigation command failed', true);
+    });
+}
+function openMapFullscreen(){
+  var grid = document.getElementById('navGrid');
+  document.getElementById('fullscreenMapSlot').appendChild(grid);
+  document.getElementById('mapFullscreen').classList.add('show');
+  if(document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(function(){});
+}
+function closeMapFullscreen(){
+  var grid = document.getElementById('navGrid');
+  document.getElementById('navGridHost').appendChild(grid);
+  document.getElementById('mapFullscreen').classList.remove('show');
+  if(document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(function(){});
+}
+document.addEventListener('fullscreenchange', function(){
+  if(!document.fullscreenElement && document.getElementById('mapFullscreen').classList.contains('show')){
+    closeMapFullscreen();
+  }
+});
+document.addEventListener('keydown', function(event){
+  if(event.key === 'Escape' && document.getElementById('mapFullscreen').classList.contains('show')){
+    closeMapFullscreen();
+  }
+});
 function closeCal(){ document.getElementById('overlay').classList.remove('show'); }
 function bgClose(e){ if(e.target.id === 'overlay') closeCal(); }
 function save(id){
   var value = document.getElementById('s' + id).value;
-  fetch('/save?key=' + id + '&value=' + value, { cache: 'no-store' });
+  if(!Number.isInteger(Number(value)) || Number(value) < -30 || Number(value) > 30){
+    showNavigationNotice('Servo offset must be a whole number from -30 to 30', true);
+    return;
+  }
+  fetch('/save?key=' + id + '&value=' + encodeURIComponent(value), { cache: 'no-store' })
+    .then(function(response){
+      if(!response.ok) throw new Error('Servo offset could not be saved');
+      showNavigationNotice('Servo ' + id + ' offset saved');
+    })
+    .catch(function(error){ showNavigationNotice(error.message, true); });
 }
 function hideDebug(){ window.location = '/debug/close'; }
-function drawNavMap(grid, heading){
+function updateVoiceButton(){
+  var button = document.getElementById('voiceToggle');
+  if(!window.speechSynthesis || typeof SpeechSynthesisUtterance === 'undefined'){
+    button.textContent = 'Voice unavailable';
+    button.disabled = true;
+    button.setAttribute('aria-pressed', 'true');
+    return;
+  }
+  button.textContent = navigationVoiceMuted ? 'Unmute voice' : 'Mute voice';
+  button.setAttribute('aria-pressed', navigationVoiceMuted ? 'true' : 'false');
+}
+function toggleNavigationVoice(){
+  navigationVoiceMuted = !navigationVoiceMuted;
+  try {
+    localStorage.setItem('navigationVoiceMuted', navigationVoiceMuted ? 'true' : 'false');
+  } catch (error) {}
+  updateVoiceButton();
+  if(navigationVoiceMuted){
+    if(window.speechSynthesis) window.speechSynthesis.cancel();
+  } else if(window.speechSynthesis){
+    speakNavigationMessage('Voice updates are on. I will keep you informed when my navigation state changes.');
+  }
+}
+function speakNavigationMessage(message){
+  if(navigationVoiceMuted || !window.speechSynthesis ||
+      typeof SpeechSynthesisUtterance === 'undefined') return;
+  window.speechSynthesis.cancel();
+  var utterance = new SpeechSynthesisUtterance(message);
+  utterance.lang = 'en-US';
+  utterance.rate = 1.02;
+  utterance.pitch = 1.0;
+  window.speechSynthesis.speak(utterance);
+}
+function describeNavigationChange(nav){
+  var reason = String(nav.reason || '').toLowerCase();
+  switch(nav.state){
+    case 'INITIALIZING':
+      return 'I am powering up and checking my systems. ' + (nav.reason || '');
+    case 'STARTUP_DELAY':
+      return 'Systems are ready. I am waiting briefly before starting autonomous patrol.';
+    case 'INITIAL_SCANNING':
+      return 'I am turning to scan my surroundings and build a map before moving.';
+    case 'EXPLORING':
+      if(reason.indexOf('resum') >= 0) return 'Resuming autonomous coverage. I will continue exploring from here.';
+      if(reason.indexOf('scan complete') >= 0) return 'The scan is complete. I found my bearings and am starting coverage.';
+      if(reason.indexOf('lane change complete') >= 0) return 'I have cleared the blockage and am continuing my sweep.';
+      return 'Path looks clear. I am continuing my autonomous coverage.';
+    case 'AVOIDING_OBSTACLE':
+      return 'Obstacle ahead at ' + (nav.distance_cm > 0 ? Math.round(nav.distance_cm) + ' centimeters. ' : '') +
+        'I am looking for a safer direction.';
+    case 'REPOSITIONING':
+      return 'This route is blocked, so I am repositioning to find another way around.';
+    case 'RECOVERING':
+      return 'I am recovering from a blocked or uncertain path. Attempt ' +
+        nav.recovery_attempts + '.';
+    case 'TARGETING':
+      return reason.indexOf('home') >= 0
+        ? 'Returning to my home position.'
+        : 'I am navigating to the requested map point.';
+    case 'PAUSED':
+      return reason.indexOf('destination reached') >= 0
+        ? 'Destination reached. I am paused and waiting for your next instruction.'
+        : 'Navigation is paused. I am holding position and waiting for you.';
+    case 'STOPPED':
+      return 'I have stopped because recovery did not find a safe path. Please check my surroundings.';
+    case 'ERROR':
+      return 'I have encountered a navigation problem. ' +
+        (nav.reason || 'Please check my sensors and surroundings.');
+    default:
+      return 'Navigation state changed to ' + String(nav.state).toLowerCase() + '.';
+  }
+}
+function announceNavigationState(nav){
+  var updateKey = String(nav.state) + '\n' + String(nav.reason || '');
+  if(updateKey === lastSpokenNavigationUpdate) return;
+  lastSpokenNavigationUpdate = updateKey;
+  speakNavigationMessage(describeNavigationChange(nav));
+}
+function drawNavMap(grid, heading, mapOffsetX, mapOffsetY){
   var canvas = document.getElementById('navMap');
   var ctx = canvas.getContext('2d');
   var width = 31;
@@ -241,17 +465,78 @@ function drawNavMap(grid, heading){
     ctx.beginPath(); ctx.moveTo(p, 0); ctx.lineTo(p, canvas.height); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(0, p); ctx.lineTo(canvas.width, p); ctx.stroke();
   }
+  var homeCellX = -mapOffsetX;
+  var homeCellY = -mapOffsetY;
+  if(homeCellX >= 0 && homeCellX < width && homeCellY >= 0 && homeCellY < width){
+    var homeX = (homeCellX + .5) * cellSize;
+    var homeY = (homeCellY + .5) * cellSize;
+    ctx.save();
+    ctx.fillStyle = 'rgba(15,23,42,.9)';
+    ctx.beginPath(); ctx.arc(homeX, homeY, cellSize * .85, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#22c55e';
+    ctx.lineWidth = Math.max(2, cellSize * .12);
+    ctx.beginPath(); ctx.arc(homeX, homeY, cellSize * .7, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = '#22c55e';
+    ctx.font = 'bold ' + Math.max(9, cellSize * .75) + 'px Arial';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('H', homeX, homeY);
+    ctx.restore();
+  }
+  if(plannedRoute.length){
+    ctx.save();
+    ctx.strokeStyle = '#f97316';
+    ctx.fillStyle = '#fb923c';
+    ctx.lineWidth = Math.max(2, cellSize * .18);
+    ctx.setLineDash([cellSize * .45, cellSize * .25]);
+    ctx.beginPath();
+    for(var routeIndex = 0; routeIndex < plannedRoute.length; routeIndex++){
+      var routeX = (plannedRoute[routeIndex].x / 10 - mapOffsetX + .5) * cellSize;
+      var routeY = (-plannedRoute[routeIndex].y / 10 - mapOffsetY + .5) * cellSize;
+      if(routeIndex === 0) ctx.moveTo(routeX, routeY);
+      else ctx.lineTo(routeX, routeY);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    plannedRoute.forEach(function(point, index){
+      var px = (point.x / 10 - mapOffsetX + .5) * cellSize;
+      var py = (-point.y / 10 - mapOffsetY + .5) * cellSize;
+      ctx.beginPath(); ctx.arc(px, py, cellSize * .3, 0, Math.PI * 2); ctx.fill();
+      if(point.animationId){
+        ctx.beginPath(); ctx.arc(px, py, cellSize * .43, 0, Math.PI * 2);
+        ctx.strokeStyle = '#fde047'; ctx.lineWidth = 2; ctx.stroke();
+      }
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold ' + Math.max(9, cellSize * .55) + 'px Arial';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(String(index + 1), px, py);
+      ctx.fillStyle = '#fb923c';
+    });
+    ctx.restore();
+  }
   var robotIndex = grid.indexOf('R');
   if(robotIndex >= 0){
     var robotX = (robotIndex % width + 0.5) * cellSize;
     var robotY = (Math.floor(robotIndex / width) + 0.5) * cellSize;
     var facing = (heading - 90) * Math.PI / 180;
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = 3;
+    var markerLength = cellSize * 1.5;
+    var markerWidth = cellSize * 1.05;
+    ctx.save();
+    ctx.translate(robotX, robotY);
+    ctx.rotate(facing);
+    ctx.fillStyle = 'rgba(15,23,42,.9)';
+    ctx.beginPath(); ctx.arc(0, 0, cellSize * 1.1, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#facc15';
     ctx.beginPath();
-    ctx.moveTo(robotX, robotY);
-    ctx.lineTo(robotX + Math.cos(facing) * cellSize * 0.8, robotY + Math.sin(facing) * cellSize * 0.8);
+    ctx.moveTo(markerLength, 0);
+    ctx.lineTo(-markerLength * 0.65, -markerWidth);
+    ctx.lineTo(-markerLength * 0.4, 0);
+    ctx.lineTo(-markerLength * 0.65, markerWidth);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
     ctx.stroke();
+    ctx.restore();
   }
 }
 function updateNavigation(){
@@ -261,25 +546,251 @@ function updateNavigation(){
       if(!response.ok || !response.data) return;
       var nav = response.data;
       document.getElementById('navState').textContent = nav.state;
+      announceNavigationState(nav);
       document.getElementById('navRange').textContent = nav.sensor_valid ? nav.distance_cm + ' cm' : 'unavailable';
       document.getElementById('navTravel').textContent = nav.distance_travelled_cm;
       document.getElementById('navArea').textContent = Number(nav.area_covered_m2).toFixed(2);
       document.getElementById('navHeading').textContent = nav.heading_deg;
       document.getElementById('navRecovery').textContent = nav.recovery_attempts;
-      drawNavMap(nav.grid, nav.heading_deg);
+      latestNavigation = nav;
+      drawNavMap(nav.grid, nav.heading_deg, nav.map_offset_x, nav.map_offset_y);
     })
-    .catch(function(){ document.getElementById('navState').textContent = 'Telemetry unavailable'; });
+    .catch(function(){ showNavigationNotice('Telemetry unavailable; check the Wi-Fi connection', true); });
 }
+
+function mapPointFromEvent(event){
+  if(!latestNavigation) return null;
+  var canvas = document.getElementById('navMap');
+  var rect = canvas.getBoundingClientRect();
+  var x = Math.floor((event.clientX - rect.left) * 31 / rect.width);
+  var y = Math.floor((event.clientY - rect.top) * 31 / rect.height);
+  if(x < 0 || x >= 31 || y < 0 || y >= 31) return null;
+  return {
+    x: (x + latestNavigation.map_offset_x) * latestNavigation.cell_size_cm,
+    y: -(y + latestNavigation.map_offset_y) * latestNavigation.cell_size_cm
+  };
+}
+function hideMapContextMenu(){
+  document.getElementById('mapContextMenu').classList.remove('show');
+}
+function showMapContextMenu(event){
+  var point = mapPointFromEvent(event);
+  if(!point) return;
+  selectedMapPoint = point;
+  var menu = document.getElementById('mapContextMenu');
+  var routeMode = drawingRoute;
+  document.getElementById('mapGoButton').style.display = routeMode ? 'none' : '';
+  document.getElementById('mapRouteButton').style.display = '';
+  document.getElementById('mapRouteButton').textContent = routeMode ? 'Finish route' : 'Draw route from here';
+  document.getElementById('mapAddRoutePointButton').style.display = routeMode ? '' : 'none';
+  var animationOptions = document.getElementById('mapAnimationOptions');
+  animationOptions.replaceChildren();
+  mapAnimations.forEach(function(animation){
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = routeMode
+      ? 'Add point + ' + animation.name
+      : 'Go here + ' + animation.name;
+    button.onclick = function(){
+      mapMenuAction(routeMode ? 'add-route-animation' : 'goto-animation', animation.id);
+    };
+    animationOptions.appendChild(button);
+  });
+  document.getElementById('mapPauseButton').textContent =
+    latestNavigation && ['PAUSED','STOPPED','ERROR'].indexOf(latestNavigation.state) >= 0
+      ? 'Resume' : 'Pause';
+  document.getElementById('mapCancelRouteButton').style.display = routeMode ? '' : 'none';
+  menu.classList.add('show');
+  var menuRect = menu.getBoundingClientRect();
+  menu.style.left = Math.max(8, Math.min(event.clientX,
+    window.innerWidth - menuRect.width - 8)) + 'px';
+  menu.style.top = Math.max(8, Math.min(event.clientY,
+    window.innerHeight - menuRect.height - 8)) + 'px';
+}
+function queueMapTarget(command, points){
+  var body = new URLSearchParams();
+  body.set('command', command);
+  if(points && points.length){
+    body.set('points', points.map(function(point){
+      return point.x + ',' + point.y + ',' + (point.animationId || 0);
+    }).join(';'));
+  }
+  return fetch('/api/v1/navigation/target', {
+    method: 'POST', body: body, cache: 'no-store',
+    headers: {'Content-Type':'application/x-www-form-urlencoded'}
+  }).then(function(response){ return response.json().then(function(json){
+    if(!response.ok || !json.ok) throw new Error(json.message || 'Navigation target rejected');
+    return json;
+  }); });
+}
+function mapMenuAction(action, animationId){
+  hideMapContextMenu();
+  if(action === 'route'){
+    if(!drawingRoute){
+      drawingRoute = true;
+      plannedRoute = [];
+      if(selectedMapPoint) plannedRoute.push({
+        x:selectedMapPoint.x, y:selectedMapPoint.y, animationId:0
+      });
+      showNavigationNotice('Select route points or add them from the map menu, then finish route');
+    } else {
+      if(!plannedRoute.length){ drawingRoute = false; return; }
+      queueMapTarget('route', plannedRoute).then(function(response){
+        showNavigationNotice(response.message || 'Route queued');
+        drawingRoute = false; updateNavigation();
+      }).catch(function(error){ showNavigationNotice(error.message, true); });
+    }
+  } else if(action === 'add-route-point' || action === 'add-route-animation'){
+    if(!drawingRoute || !selectedMapPoint) return;
+    if(plannedRoute.length >= 12){
+      showNavigationNotice('Route limit is 12 points', true);
+      return;
+    }
+    plannedRoute.push({
+      x:selectedMapPoint.x, y:selectedMapPoint.y,
+      animationId: action === 'add-route-animation' ? animationId : 0
+    });
+    showNavigationNotice('Route point ' + plannedRoute.length + ' added');
+    if(latestNavigation) drawNavMap(latestNavigation.grid, latestNavigation.heading_deg,
+      latestNavigation.map_offset_x, latestNavigation.map_offset_y);
+  } else if(action === 'cancel'){
+    drawingRoute = false; plannedRoute = []; updateNavigation();
+  } else if(action === 'goto' && selectedMapPoint){
+    queueMapTarget('goto', [{x:selectedMapPoint.x,y:selectedMapPoint.y,animationId:0}]).then(function(response){
+      showNavigationNotice(response.message || 'Destination queued');
+      plannedRoute = [selectedMapPoint]; updateNavigation();
+    }).catch(function(error){ showNavigationNotice(error.message, true); });
+  } else if(action === 'goto-animation' && selectedMapPoint){
+    queueMapTarget('goto', [{
+      x:selectedMapPoint.x, y:selectedMapPoint.y, animationId:animationId
+    }]).then(function(response){
+      showNavigationNotice(response.message || 'Destination queued');
+      plannedRoute = [{x:selectedMapPoint.x,y:selectedMapPoint.y,animationId:animationId}];
+      updateNavigation();
+    }).catch(function(error){ showNavigationNotice(error.message, true); });
+  } else if(action === 'home'){
+    queueMapTarget('home', []).then(function(response){
+      plannedRoute = [{x:0,y:0}]; showNavigationNotice(response.message || 'Returning home');
+      updateNavigation();
+    }).catch(function(error){ showNavigationNotice(error.message, true); });
+  } else if(action === 'pause'){
+    var command = latestNavigation &&
+      ['PAUSED','STOPPED','ERROR'].indexOf(latestNavigation.state) >= 0
+      ? 'resume' : 'pause';
+    controlNavigation(command);
+  }
+}
+var navigationMapCanvas = document.getElementById('navMap');
+navigationMapCanvas.addEventListener('contextmenu', function(event){
+  event.preventDefault(); showMapContextMenu(event);
+});
+navigationMapCanvas.addEventListener('pointerdown', function(event){
+  if(event.pointerType !== 'touch') return;
+  window.clearTimeout(longPressTimer);
+  longPressTimer = window.setTimeout(function(){
+    ignoreNextMapClick = true;
+    showMapContextMenu(event);
+  }, 550);
+});
+['pointerup','pointercancel','pointerleave'].forEach(function(name){
+  navigationMapCanvas.addEventListener(name, function(){ window.clearTimeout(longPressTimer); });
+});
+navigationMapCanvas.addEventListener('click', function(event){
+  if(ignoreNextMapClick){ ignoreNextMapClick = false; return; }
+  if(!drawingRoute) return;
+  var point = mapPointFromEvent(event);
+  if(!point) return;
+  if(plannedRoute.length >= 12){
+    showNavigationNotice('Route limit is 12 points', true);
+    return;
+  }
+  point.animationId = 0;
+  plannedRoute.push(point);
+  drawNavMap(latestNavigation.grid, latestNavigation.heading_deg,
+    latestNavigation.map_offset_x, latestNavigation.map_offset_y);
+});
+document.addEventListener('pointerdown', function(event){
+  if(!event.target.closest || !event.target.closest('#mapContextMenu')) hideMapContextMenu();
+});
 updateNavigation();
-window.setInterval(updateNavigation, 1500);
+window.setInterval(updateNavigation, 500);
+updateVoiceButton();
 function openCal(){
-  fetch('/setting1', { cache: 'no-store' })
-    .then(function(r){ return r.json(); })
-    .then(function(values){
+  Promise.all([
+    fetch('/setting1', { cache: 'no-store' }).then(function(r){ return r.json(); }),
+    fetch('/api/v1/calibration/steering', { cache: 'no-store' })
+      .then(function(r){
+        if(!r.ok) throw new Error('Could not load steering calibration');
+        return r.json();
+      }),
+    fetch('/api/v1/calibration/rotation', { cache: 'no-store' })
+      .then(function(r){
+        if(!r.ok) throw new Error('Could not load turn calibration');
+        return r.json();
+      })
+  ]).then(function(results){
+      var values = results[0];
+      var steering = results[1];
+      var rotation = results[2];
+      if(!steering.ok || !steering.data ||
+          typeof steering.data.degrees_per_meter !== 'number'){
+        throw new Error(steering.message || 'Invalid steering calibration response');
+      }
+      if(!rotation.ok || !rotation.data ||
+          typeof rotation.data.observed_360_degrees !== 'number'){
+        throw new Error(rotation.message || 'Invalid turn calibration response');
+      }
       for (var i = 0; i < 8; i++) {
         document.getElementById('s' + i).value = values[i] || 0;
       }
+      document.getElementById('steeringCorrection').value =
+        steering.data.degrees_per_meter;
+      document.getElementById('rotation360Observed').value =
+        rotation.data.observed_360_degrees;
       document.getElementById('overlay').classList.add('show');
+    }).catch(function(error){
+      showNavigationNotice(error.message, true);
+    });
+}
+function saveSteeringCorrection(){
+  var value = Number(document.getElementById('steeringCorrection').value);
+  if(!Number.isInteger(value) || value < -90 || value > 90){
+    showNavigationNotice(
+      'Steering correction must be a whole number from -90 to 90 degrees per meter', true);
+    return;
+  }
+  fetch('/api/v1/calibration/steering', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({degrees_per_meter:value})
+  }).then(function(response){ return response.json(); })
+    .then(function(response){
+      if(!response.ok) throw new Error(response.message || 'Could not save steering calibration');
+      showNavigationNotice(
+        'Forward steering correction saved: ' +
+        response.data.degrees_per_meter + ' deg/m');
+    }).catch(function(error){
+      showNavigationNotice(error.message, true);
+    });
+}
+function saveRotationCalibration(){
+  var observed360 = Number(document.getElementById('rotation360Observed').value);
+  if(!Number.isInteger(observed360) || observed360 < 300 || observed360 > 420){
+    showNavigationNotice('Measured 360° turn must be a whole number from 300° to 420°', true);
+    return;
+  }
+  fetch('/api/v1/calibration/rotation', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({observed_360_degrees:observed360})
+  }).then(function(response){ return response.json(); })
+    .then(function(response){
+      if(!response.ok) throw new Error(response.message || 'Could not save turn calibration');
+      showNavigationNotice(
+        'Universal turn calibration saved: 360° command -> ' +
+        response.data.observed_360_degrees + '° measured');
+    }).catch(function(error){
+      showNavigationNotice(error.message, true);
     });
 }
 </script>
@@ -324,6 +835,75 @@ void writeKeyValue(int8_t key, int8_t value)
 int8_t readKeyValue(int8_t key)
 {
     return (int8_t)EEPROM.read(key);
+}
+
+static const int kForwardSteeringValueAddress = 8;
+static const int kForwardSteeringMarkerAddress = 9;
+static const uint8_t kForwardSteeringMarker = 0xA7;
+static const int8_t kDefaultForwardSteeringCorrection = 30;
+static const int kRotation360ValueAddress = 12;
+static const int kRotationCalibrationMarkerAddress = 14;
+static const uint8_t kRotationCalibrationMarker = 0xD3;
+static const uint16_t kDefaultObserved360Degrees = 360;
+
+int8_t getForwardSteeringCorrection()
+{
+    if (EEPROM.read(kForwardSteeringMarkerAddress) != kForwardSteeringMarker) {
+        return kDefaultForwardSteeringCorrection;
+    }
+    const int8_t correction =
+        (int8_t)EEPROM.read(kForwardSteeringValueAddress);
+    return correction >= -90 && correction <= 90
+        ? correction : kDefaultForwardSteeringCorrection;
+}
+
+bool setForwardSteeringCorrection(int degreesPerMeter)
+{
+    if (degreesPerMeter < -90 || degreesPerMeter > 90) {
+        return false;
+    }
+    EEPROM.write(kForwardSteeringValueAddress, (uint8_t)(int8_t)degreesPerMeter);
+    EEPROM.write(kForwardSteeringMarkerAddress, kForwardSteeringMarker);
+    return EEPROM.commit();
+}
+
+static uint16_t readEepromUint16(int address)
+{
+    return (uint16_t)EEPROM.read(address) |
+        ((uint16_t)EEPROM.read(address + 1) << 8);
+}
+
+static void writeEepromUint16(int address, uint16_t value)
+{
+    EEPROM.write(address, (uint8_t)(value & 0xFF));
+    EEPROM.write(address + 1, (uint8_t)(value >> 8));
+}
+
+uint16_t getObserved360RotationDegrees()
+{
+    if (EEPROM.read(kRotationCalibrationMarkerAddress) !=
+        kRotationCalibrationMarker) {
+        return kDefaultObserved360Degrees;
+    }
+    const uint16_t value = readEepromUint16(kRotation360ValueAddress);
+    return value >= 300 && value <= 420
+        ? value : kDefaultObserved360Degrees;
+}
+
+float getRotationCalibrationScale()
+{
+    return (float)getObserved360RotationDegrees() / 360.0f;
+}
+
+bool setObserved360RotationDegrees(uint16_t observed360)
+{
+    if (observed360 < 300 || observed360 > 420) {
+        return false;
+    }
+    writeEepromUint16(kRotation360ValueAddress, observed360);
+    EEPROM.write(kRotationCalibrationMarkerAddress,
+        kRotationCalibrationMarker);
+    return EEPROM.commit();
 }
 
 const RobotActionInfo* getRobotActions(size_t& count)
@@ -426,17 +1006,117 @@ int getRobotStopTargetProgram()
     return g_stopTargetProgram;
 }
 
-void publishNavigationTelemetry(const char* state, float distanceCm,
-    float distanceTravelledCm, float areaCoveredM2, int headingDegrees, int recoveryAttempts,
-    bool sensorValid, const uint16_t scanDistancesCm[12],
+bool queueNavigationControl(NavigationControl control)
+{
+    if (control == NAV_CONTROL_NONE || Servo_PROGRAM >= 1 ||
+        g_navigationControl != NAV_CONTROL_NONE ||
+        g_navigationTargetKind != NAV_TARGET_NONE) {
+        return false;
+    }
+    g_navigationControl = control;
+    return true;
+}
+
+NavigationControl takeNavigationControl()
+{
+    const NavigationControl control = g_navigationControl;
+    g_navigationControl = NAV_CONTROL_NONE;
+    return control;
+}
+
+bool hasNavigationControlPending()
+{
+    return g_navigationControl != NAV_CONTROL_NONE;
+}
+
+bool queueNavigationTarget(NavigationTargetKind kind,
+    const NavigationWaypoint* waypoints, uint8_t count)
+{
+    if (kind == NAV_TARGET_NONE || Servo_PROGRAM >= 1 ||
+        g_navigationTargetKind != NAV_TARGET_NONE ||
+        g_navigationControl != NAV_CONTROL_NONE ||
+        (kind == NAV_TARGET_POINT && count != 1) ||
+        (kind == NAV_TARGET_ROUTE && (count == 0 || count > MAX_NAVIGATION_WAYPOINTS)) ||
+        (kind == NAV_TARGET_HOME && count != 0) ||
+        (count > 0 && waypoints == nullptr)) {
+        return false;
+    }
+    for (uint8_t i = 0; i < count; ++i) {
+        if (waypoints[i].xCm != waypoints[i].xCm ||
+            waypoints[i].yCm != waypoints[i].yCm ||
+            fabsf(waypoints[i].xCm) > 5000.0f ||
+            fabsf(waypoints[i].yCm) > 5000.0f) {
+            return false;
+        }
+        const int16_t animationId = waypoints[i].animationId;
+        if (animationId != PROGRAM_NONE && animationId != PROGRAM_HELLO &&
+            animationId != PROGRAM_PUSHUP && animationId != PROGRAM_LIE &&
+            animationId != PROGRAM_FIGHTING && animationId != PROGRAM_SLEEP &&
+            animationId != PROGRAM_DANCE1 && animationId != PROGRAM_DANCE2 &&
+            animationId != PROGRAM_DANCE3) {
+            return false;
+        }
+        if (kind != NAV_TARGET_HOME) {
+            const float localX = waypoints[i].xCm / 10.0f -
+                g_navigationTelemetry.mapOffsetX;
+            const float localY = -waypoints[i].yCm / 10.0f -
+                g_navigationTelemetry.mapOffsetY;
+            if (localX < 0.0f || localX >= 31.0f ||
+                localY < 0.0f || localY >= 31.0f) {
+                return false;
+            }
+            const int cellX = (int)lroundf(localX);
+            const int cellY = (int)lroundf(localY);
+            if (cellX >= 31 || cellY >= 31 ||
+                g_navigationTelemetry.occupancyGrid[cellY * 31 + cellX] == 2) {
+                return false;
+            }
+        }
+        g_navigationWaypoints[i] = waypoints[i];
+    }
+    g_navigationWaypointCount = count;
+    g_navigationTargetKind = kind;
+    return true;
+}
+
+NavigationTargetKind takeNavigationTarget(NavigationWaypoint* waypoints,
+    uint8_t& count)
+{
+    const NavigationTargetKind kind = g_navigationTargetKind;
+    count = g_navigationWaypointCount;
+    if (kind != NAV_TARGET_NONE && waypoints != nullptr) {
+        for (uint8_t i = 0; i < count; ++i) {
+            waypoints[i] = g_navigationWaypoints[i];
+        }
+    }
+    g_navigationWaypointCount = 0;
+    g_navigationTargetKind = NAV_TARGET_NONE;
+    return kind;
+}
+
+bool hasNavigationTargetPending()
+{
+    return g_navigationTargetKind != NAV_TARGET_NONE;
+}
+
+void publishNavigationTelemetry(const char* state, const char* reason,
+    float distanceCm, float distanceTravelledCm, float areaCoveredM2,
+    float headingDegrees,
+    int mapOffsetX, int mapOffsetY, int recoveryAttempts, bool sensorValid,
+    const uint16_t scanDistancesCm[12],
     const uint8_t occupancyGrid[31 * 31])
 {
     strncpy(g_navigationTelemetry.state, state, sizeof(g_navigationTelemetry.state) - 1);
     g_navigationTelemetry.state[sizeof(g_navigationTelemetry.state) - 1] = '\0';
+    strncpy(g_navigationTelemetry.reason, reason,
+        sizeof(g_navigationTelemetry.reason) - 1);
+    g_navigationTelemetry.reason[sizeof(g_navigationTelemetry.reason) - 1] = '\0';
     g_navigationTelemetry.distanceCm = distanceCm;
     g_navigationTelemetry.distanceTravelledCm = distanceTravelledCm;
     g_navigationTelemetry.areaCoveredM2 = areaCoveredM2;
     g_navigationTelemetry.headingDegrees = headingDegrees;
+    g_navigationTelemetry.mapOffsetX = mapOffsetX;
+    g_navigationTelemetry.mapOffsetY = mapOffsetY;
     g_navigationTelemetry.recoveryAttempts = recoveryAttempts;
     g_navigationTelemetry.sensorValid = sensorValid;
     memcpy(g_navigationTelemetry.scanDistancesCm, scanDistancesCm,
@@ -846,10 +1526,12 @@ static void handleApiState()
 static void handleApiNavigation()
 {
     String data;
-    data.reserve(1450);
+    data.reserve(1600);
     data = "{";
     data += "\"state\":\"";
     data += g_navigationTelemetry.state;
+    data += "\",\"reason\":\"";
+    data += g_navigationTelemetry.reason;
     data += "\",\"sensor_valid\":";
     data += g_navigationTelemetry.sensorValid ? "true" : "false";
     data += ",\"distance_cm\":";
@@ -859,7 +1541,11 @@ static void handleApiNavigation()
     data += ",\"area_covered_m2\":";
     data += String(g_navigationTelemetry.areaCoveredM2, 2);
     data += ",\"heading_deg\":";
-    data += String(g_navigationTelemetry.headingDegrees);
+    data += String(g_navigationTelemetry.headingDegrees, 2);
+    data += ",\"map_offset_x\":";
+    data += String(g_navigationTelemetry.mapOffsetX);
+    data += ",\"map_offset_y\":";
+    data += String(g_navigationTelemetry.mapOffsetY);
     data += ",\"recovery_attempts\":";
     data += String(g_navigationTelemetry.recoveryAttempts);
     data += ",\"scan_cm\":[";
@@ -877,6 +1563,127 @@ static void handleApiNavigation()
     }
     data += "\"}";
     sendJsonResponse(200, true, 0, "OK", data);
+}
+
+static void handleApiNavigationControl()
+{
+    if (!server.hasArg("command")) {
+        sendJsonError(400, 4010, "missing navigation command");
+        return;
+    }
+
+    const String command = server.arg("command");
+    NavigationControl control = NAV_CONTROL_NONE;
+    if (command == "resume") {
+        control = NAV_CONTROL_RESUME;
+    } else if (command == "pause") {
+        control = NAV_CONTROL_PAUSE;
+    } else if (command == "restart") {
+        control = NAV_CONTROL_RESTART;
+    } else {
+        sendJsonError(400, 4011, "invalid navigation command");
+        return;
+    }
+
+    if (!queueNavigationControl(control)) {
+        sendJsonError(409, 4012,
+            "navigation command unavailable during a manual action or another pending command");
+        return;
+    }
+
+    sendJsonResponse(202, true, 0, "navigation command queued", "");
+}
+
+static bool parseNavigationPoints(const String& encoded, NavigationWaypoint* points,
+    uint8_t& count)
+{
+    count = 0;
+    const char* cursor = encoded.c_str();
+    const char* const end = cursor + encoded.length();
+    while (cursor < end) {
+        if (count >= MAX_NAVIGATION_WAYPOINTS) {
+            return false;
+        }
+        char* parsed = nullptr;
+        const float x = strtof(cursor, &parsed);
+        if (parsed == cursor || parsed >= end || *parsed != ',' ||
+            x != x || fabsf(x) > 5000.0f) {
+            return false;
+        }
+        cursor = parsed + 1;
+        const float y = strtof(cursor, &parsed);
+        if (parsed == cursor || y != y ||
+            fabsf(x) > 5000.0f || fabsf(y) > 5000.0f) {
+            return false;
+        }
+        int16_t animationId = PROGRAM_NONE;
+        cursor = parsed;
+        if (cursor < end && *cursor == ',') {
+            cursor++;
+            char* animationEnd = nullptr;
+            const long parsedAnimation = strtol(cursor, &animationEnd, 10);
+            if (animationEnd == cursor || parsedAnimation < -32768L ||
+                parsedAnimation > 32767L) {
+                return false;
+            }
+            animationId = (int16_t)parsedAnimation;
+            cursor = animationEnd;
+        }
+        points[count].xCm = x;
+        points[count].yCm = y;
+        points[count].animationId = animationId;
+        ++count;
+        if (cursor == end) {
+            break;
+        }
+        if (*cursor != ';') {
+            return false;
+        }
+        ++cursor;
+        if (cursor == end) {
+            return false;
+        }
+    }
+    return count > 0;
+}
+
+static void handleApiNavigationTarget()
+{
+    if (!server.hasArg("command")) {
+        sendJsonError(400, 4020, "missing navigation target command");
+        return;
+    }
+
+    const String command = server.arg("command");
+    NavigationTargetKind kind = NAV_TARGET_NONE;
+    NavigationWaypoint points[MAX_NAVIGATION_WAYPOINTS];
+    uint8_t count = 0;
+    if (command == "goto") {
+        kind = NAV_TARGET_POINT;
+    } else if (command == "route") {
+        kind = NAV_TARGET_ROUTE;
+    } else if (command == "home") {
+        kind = NAV_TARGET_HOME;
+    } else {
+        sendJsonError(400, 4021, "invalid navigation target command");
+        return;
+    }
+
+    if (kind == NAV_TARGET_POINT || kind == NAV_TARGET_ROUTE) {
+        if (!server.hasArg("points") ||
+            !parseNavigationPoints(server.arg("points"), points, count) ||
+            (kind == NAV_TARGET_POINT && count != 1)) {
+            sendJsonError(400, 4022, "invalid navigation target coordinates");
+            return;
+        }
+    }
+
+    if (!queueNavigationTarget(kind, points, count)) {
+        sendJsonError(409, 4023,
+            "target unavailable, outside the current map, or inside a known obstacle");
+        return;
+    }
+    sendJsonResponse(202, true, 0, "navigation target queued", "");
 }
 
 static void handleApiAction()
@@ -927,6 +1734,105 @@ static void handleApiCalibrationPost()
     data += buildCalibrationJsonArray();
     data += "}";
 
+    sendJsonResponse(200, true, 0, "saved", data);
+}
+
+static void handleApiSteeringCalibrationGet()
+{
+    String data = "{\"degrees_per_meter\":";
+    data += String(getForwardSteeringCorrection());
+    data += "}";
+    sendJsonResponse(200, true, 0, "OK", data);
+}
+
+static bool isJsonIntegerProperty(const String& body, const char* property)
+{
+    String token = "\"";
+    token += property;
+    token += "\"";
+    const int keyPos = body.indexOf(token);
+    if (keyPos < 0) {
+        return false;
+    }
+    const int colonPos = body.indexOf(':', keyPos);
+    if (colonPos < 0) {
+        return false;
+    }
+    int cursor = colonPos + 1;
+    while (cursor < body.length() && isspace(body[cursor])) {
+        ++cursor;
+    }
+    if (cursor < body.length() && body[cursor] == '-') {
+        ++cursor;
+    }
+    const int digitStart = cursor;
+    while (cursor < body.length() && isdigit(body[cursor])) {
+        ++cursor;
+    }
+    if (cursor == digitStart) {
+        return false;
+    }
+    while (cursor < body.length() && isspace(body[cursor])) {
+        ++cursor;
+    }
+    return cursor < body.length() &&
+        (body[cursor] == ',' || body[cursor] == '}');
+}
+
+static bool parseSteeringCalibrationValue(int& degreesPerMeter)
+{
+    const String body = server.arg("plain");
+    return isJsonIntegerProperty(body, "degrees_per_meter") &&
+        extractJsonInt(body, "degrees_per_meter", degreesPerMeter);
+}
+
+static void handleApiSteeringCalibrationPost()
+{
+    int degreesPerMeter = 0;
+    if (!parseSteeringCalibrationValue(degreesPerMeter) ||
+        degreesPerMeter < -90 || degreesPerMeter > 90) {
+        sendJsonError(400, 4005,
+            "degrees_per_meter must be a whole number from -90 to 90");
+        return;
+    }
+    if (!setForwardSteeringCorrection(degreesPerMeter)) {
+        sendJsonError(500, 5005, "could not persist steering calibration");
+        return;
+    }
+
+    String data = "{\"degrees_per_meter\":";
+    data += String(getForwardSteeringCorrection());
+    data += "}";
+    sendJsonResponse(200, true, 0, "saved", data);
+}
+
+static void handleApiRotationCalibrationGet()
+{
+    String data = "{\"observed_360_degrees\":";
+    data += String(getObserved360RotationDegrees());
+    data += "}";
+    sendJsonResponse(200, true, 0, "OK", data);
+}
+
+static void handleApiRotationCalibrationPost()
+{
+    const String body = server.arg("plain");
+    int observed360 = 0;
+    if (!isJsonIntegerProperty(body, "observed_360_degrees") ||
+        !extractJsonInt(body, "observed_360_degrees", observed360) ||
+        observed360 < 300 || observed360 > 420) {
+        sendJsonError(400, 4006,
+            "observed_360_degrees must be a whole number from 300 to 420");
+        return;
+    }
+    if (!setObserved360RotationDegrees((uint16_t)observed360)) {
+        sendJsonError(500, 5006, "could not persist turn calibration");
+        return;
+    }
+
+    String data = "{\"observed_360_degrees\":";
+    data += String(getObserved360RotationDegrees());
+    data += "}";
     sendJsonResponse(200, true, 0, "saved", data);
 }
 
@@ -998,15 +1904,19 @@ void handleSave()
     String key   = server.arg("key");
     String value = server.arg("value");
 
-    int8_t keyInt   = (int8_t)key.toInt();
-    int8_t valueInt = (int8_t)value.toInt();
+    const int keyInt = key.toInt();
+    const int valueInt = value.toInt();
 
     delay(50);
 
     if (keyInt == 100) {
         for (int i = 0; i < 8; i++) writeKeyValue(i, 0);
-    } else if (valueInt >= -124 && valueInt <= 124) {
-        writeKeyValue(keyInt, valueInt);
+    } else if (keyInt >= 0 && keyInt < ALLSERVOS &&
+        valueInt >= -124 && valueInt <= 124) {
+        writeKeyValue((int8_t)keyInt, (int8_t)valueInt);
+    } else {
+        server.send(400, "text/plain", "Invalid servo calibration");
+        return;
     }
 
     delay(10);
@@ -1061,9 +1971,19 @@ void enableWebServer()
     server.on("/api/v1/info",        HTTP_GET, handleApiInfo);
     server.on("/api/v1/state",       HTTP_GET, handleApiState);
     server.on("/api/v1/navigation", HTTP_GET, handleApiNavigation);
+    server.on("/api/v1/navigation/control", HTTP_POST, handleApiNavigationControl);
+    server.on("/api/v1/navigation/target", HTTP_POST, handleApiNavigationTarget);
     server.on("/api/v1/action",      HTTP_POST, handleApiAction);
     server.on("/api/v1/calibration", HTTP_GET, handleApiCalibrationGet);
     server.on("/api/v1/calibration", HTTP_POST, handleApiCalibrationPost);
+    server.on("/api/v1/calibration/steering", HTTP_GET,
+        handleApiSteeringCalibrationGet);
+    server.on("/api/v1/calibration/steering", HTTP_POST,
+        handleApiSteeringCalibrationPost);
+    server.on("/api/v1/calibration/rotation", HTTP_GET,
+        handleApiRotationCalibrationGet);
+    server.on("/api/v1/calibration/rotation", HTTP_POST,
+        handleApiRotationCalibrationPost);
     server.on("/api/v1/servo",       HTTP_POST, handleApiServo);
     server.on("/api/v1/stop",        HTTP_POST, handleApiStop);
 

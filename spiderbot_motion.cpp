@@ -1,6 +1,7 @@
 #include "spiderbot_motion.h"
 
 #include <EEPROM.h>
+#include <math.h>
 
 #include "webserver.h"
 
@@ -16,6 +17,8 @@ int Running_Servo_POS[ALLMATRIX];
 
 // Shorten each motion keyframe and update servo targets more frequently.
 static const int MOTION_TIME_SCALE_PERCENT = 60;
+static const float kForwardStepDistanceCm = 8.0f;
+static const float kFullTurnDegrees = 18.70f;
 int BASEDELAYTIME = 5;
 
 void SpiderBotMotion::SetMotionDelay(int delayMs)
@@ -223,6 +226,25 @@ void SpiderBotMotion::standby()
 void SpiderBotMotion::forward()
 {
     Servo_PROGRAM_Run(Servo_Prg_2, Servo_Prg_2_Step);
+    if (isRobotStopRequested()) {
+        return;
+    }
+
+    const int correctionDegreesPerMeter = getForwardSteeringCorrection();
+    const float correctionDegrees =
+        fabsf((float)correctionDegreesPerMeter) *
+        kForwardStepDistanceCm / 100.0f;
+    if (correctionDegrees < 0.01f) {
+        return;
+    }
+
+    const float fraction =
+        correctionDegrees / (kFullTurnDegrees * getRotationCalibrationScale());
+    if (correctionDegreesPerMeter > 0) {
+        turnrightFraction(fraction);
+    } else {
+        turnleftFraction(fraction);
+    }
 }
 
 void SpiderBotMotion::backward()
@@ -245,9 +267,47 @@ void SpiderBotMotion::turnleft()
     Servo_PROGRAM_Run(Servo_Prg_6, Servo_Prg_6_Step);
 }
 
+void SpiderBotMotion::turnleftFraction(float fraction)
+{
+    if (fraction <= 0.0f || fraction > 1.0f) {
+        return;
+    }
+
+    int scaledMatrix[Servo_Prg_6_Step][ALLMATRIX];
+    for (int row = 0; row < Servo_Prg_6_Step; ++row) {
+        for (int column = 0; column < ALLMATRIX - 1; ++column) {
+            const int baseline = Servo_Prg_6[0][column];
+            const int target = Servo_Prg_6[row][column];
+            scaledMatrix[row][column] = baseline +
+                (int)lroundf((target - baseline) * fraction);
+        }
+        scaledMatrix[row][ALLMATRIX - 1] = Servo_Prg_6[row][ALLMATRIX - 1];
+    }
+    Servo_PROGRAM_Run(scaledMatrix, Servo_Prg_6_Step);
+}
+
 void SpiderBotMotion::turnright()
 {
     Servo_PROGRAM_Run(Servo_Prg_7, Servo_Prg_7_Step);
+}
+
+void SpiderBotMotion::turnrightFraction(float fraction)
+{
+    if (fraction <= 0.0f || fraction > 1.0f) {
+        return;
+    }
+
+    int scaledMatrix[Servo_Prg_7_Step][ALLMATRIX];
+    for (int row = 0; row < Servo_Prg_7_Step; ++row) {
+        for (int column = 0; column < ALLMATRIX - 1; ++column) {
+            const int baseline = Servo_Prg_7[0][column];
+            const int target = Servo_Prg_7[row][column];
+            scaledMatrix[row][column] = baseline +
+                (int)lroundf((target - baseline) * fraction);
+        }
+        scaledMatrix[row][ALLMATRIX - 1] = Servo_Prg_7[row][ALLMATRIX - 1];
+    }
+    Servo_PROGRAM_Run(scaledMatrix, Servo_Prg_7_Step);
 }
 
 void SpiderBotMotion::lie()

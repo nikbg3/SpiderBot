@@ -29,7 +29,9 @@ public:
     void leftshift(); // Shift left.
     void rightshift(); // Shift right.
     void turnleft(); // Turn left.
+    void turnleftFraction(float fraction); // Perform a complete, reduced-amplitude left-turn gait.
     void turnright(); // Turn right.
+    void turnrightFraction(float fraction); // Perform a complete, reduced-amplitude right-turn gait.
     void lie(); // Lie down.
     void hello(); // Greeting motion.
     void fighting(); // Fighting pose.

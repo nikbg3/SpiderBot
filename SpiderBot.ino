@@ -49,6 +49,7 @@ enum NavigationState {
   NAV_AVOIDING_OBSTACLE,
   NAV_REPOSITIONING,
   NAV_RECOVERING,
+  NAV_TARGETING,
   NAV_PAUSED,
   NAV_STOPPED,
   NAV_ERROR
@@ -64,20 +65,25 @@ struct NavigationConfig {
   uint32_t startupDelayMs;
   float safeTurnDistanceCm;
   uint8_t maxRecoveryAttempts;
-  uint8_t scanSteps;
 };
+
+static const float kForwardStepDistanceCm = 8.0f;
+static const float kTurnAngleDegrees = 18.70f;
 
 static const NavigationConfig kDefaultNavConfig = {
   5000,
   30.0f,
-  3,
-  20
+  3
 };
 
 static const uint8_t kMapWidth = 31;
 static const uint8_t kMapHeight = 31;
-static const int kEstimatedTurnAngleDegrees = 18;
+static const uint8_t kLaneLengthSteps = 12;
+static const uint8_t kLaneSpacingSteps = 2;
 static const uint8_t kMaxBlockedCyclesBeforeRecovery = 5;
+static const uint8_t kMaxInvalidSensorCycles = 5;
+static const uint8_t kSensorRecoveryReadAttempts = 3;
+static const uint16_t kSensorRecoveryRetryDelayMs = 80;
 static const float kMapCellSizeCm = 10.0f;
 static const uint8_t kMapOriginX = kMapWidth / 2;
 static const uint8_t kMapOriginY = kMapHeight / 2;
@@ -90,16 +96,25 @@ enum MapCell : uint8_t {
   MAP_ROBOT = 4
 };
 
+enum SensorRecoveryResult : uint8_t {
+  SENSOR_RECOVERED,
+  SENSOR_RECOVERY_FAILED,
+  SENSOR_RECOVERY_INTERRUPTED
+};
+
 static NavigationConfig g_navigationConfig = kDefaultNavConfig;
 static NavigationState g_navigationState = NAV_INITIALIZING;
 static bool g_autonomousEnabled = false;
 static bool g_initialScanComplete = false;
 static uint32_t g_startupDeadlineMs = 0;
-static int g_explorationDirection = 1;
+static int g_laneChangeDirection = 1;
 static int g_recoveryAttempts = 0;
 static uint8_t g_blockedCycles = 0;
+static uint8_t g_invalidSensorCycles = 0;
+static uint8_t g_laneForwardSteps = 0;
 static uint32_t g_lastTelemetryPublishMs = 0;
-static int g_estimatedHeadingDegrees = 0;
+static char g_navigationReason[96] = "Starting up";
+static float g_estimatedHeadingDegrees = 0.0f;
 static float g_distanceTravelledCm = 0.0f;
 static float g_lastMovementCm = 0.0f;
 static float g_currentDistanceCm = -1.0f;
@@ -108,9 +123,31 @@ static uint8_t g_occupancyGrid[kMapWidth * kMapHeight] = {0};
 static uint8_t g_shiftedOccupancyGrid[kMapWidth * kMapHeight];
 static float g_mapPositionX = kMapOriginX;
 static float g_mapPositionY = kMapOriginY;
+static int g_mapOffsetX = -kMapOriginX;
+static int g_mapOffsetY = -kMapOriginY;
+static float g_worldPositionX = 0.0f;
+static float g_worldPositionY = 0.0f;
+static NavigationWaypoint g_activeWaypoints[MAX_NAVIGATION_WAYPOINTS];
+static uint8_t g_activeWaypointCount = 0;
+static uint8_t g_activeWaypointIndex = 0;
+static bool g_targetNavigationActive = false;
+static NavigationTargetKind g_activeTargetKind = NAV_TARGET_NONE;
+static bool g_targetDetourActive = false;
+static float g_targetDetourHeading = 0.0f;
 static SensorScanSample g_scanSamples[36];
 static int g_scanSampleCount = 0;
 static uint16_t g_scanDistancesCm[12] = {0};
+static bool g_scanInProgress = false;
+static NavigationState g_scanReturnState = NAV_INITIAL_SCANNING;
+static float g_scanStartHeadingDegrees = 0.0f;
+static uint8_t g_scanNextStep = 0;
+static uint8_t g_scanStepCount = 0;
+static float g_scanCommandDegrees = 360.0f;
+static float g_scanDegreesPerCommandDegree = 1.0f;
+static float g_scanLeftScore = 0.0f;
+static float g_scanRightScore = 0.0f;
+static int g_scanLeftCount = 0;
+static int g_scanRightCount = 0;
 
 // Main robot motion object plus a few local helpers used by setup/loop.
 SpiderBotMotion robot;
@@ -118,19 +155,34 @@ static int decodeIrProgram(uint32_t code);
 static void runRobotProgram(int programId);
 static float measureAvoidDistanceCm();
 static bool verifyRobotHardware();
+static SensorRecoveryResult recoverUltrasonicSensor();
 static const char* navigationStateName(NavigationState state);
 static void logNavigationEvent(const char* message);
-static bool performInitialScan();
+static bool perform360Scan();
 static void updateAutonomousNavigation();
+static void processNavigationControl();
+static void processNavigationTarget();
+static void updateTargetNavigation();
+static bool rotateQuarterTurn(int direction);
+static bool rotateByDegrees(int direction, float degrees,
+    int executingProgramId = PROGRAM_NONE);
+static bool performTurnStep(int direction, float degrees,
+    float estimatedDegrees = -1.0f,
+    int executingProgramId = PROGRAM_NONE);
+static bool moveForwardSteps(uint8_t steps, bool countAsLaneProgress,
+    bool checkObstacles = false);
+static bool changeLane(int direction, bool reverseFirst);
 static int chooseSafeTurnDirection();
 static void triggerRecovery();
-static void publishNavigationStatus();
+static void publishNavigationStatus(bool force = false);
 static uint16_t countMappedCells();
 static bool mapCellInBounds(int x, int y);
 static void markMapCell(int x, int y, MapCell cell);
 static void recenterMapForPosition(float& x, float& y);
 static void mapRangeMeasurement(float distanceCm, float headingDegrees);
 static void recordEstimatedMovement(float distanceCm);
+static float normalizeHeadingDegrees(float headingDegrees);
+static float signedHeadingErrorDegrees(float targetDegrees, float currentDegrees);
 
 static const char* navigationStateName(NavigationState state)
 {
@@ -142,6 +194,7 @@ static const char* navigationStateName(NavigationState state)
     case NAV_AVOIDING_OBSTACLE: return "AVOIDING_OBSTACLE";
     case NAV_REPOSITIONING: return "REPOSITIONING";
     case NAV_RECOVERING: return "RECOVERING";
+    case NAV_TARGETING: return "TARGETING";
     case NAV_PAUSED: return "PAUSED";
     case NAV_STOPPED: return "STOPPED";
     case NAV_ERROR: return "ERROR";
@@ -151,6 +204,9 @@ static const char* navigationStateName(NavigationState state)
 
 static void logNavigationEvent(const char* message)
 {
+  strncpy(g_navigationReason, message, sizeof(g_navigationReason) - 1);
+  g_navigationReason[sizeof(g_navigationReason) - 1] = '\0';
+  publishNavigationStatus(true);
   if (ENABLE_DEBUG_SERIAL) {
     Serial.print(millis());
     Serial.print(" ms | ");
@@ -162,28 +218,63 @@ static void logNavigationEvent(const char* message)
 
 static bool verifyRobotHardware()
 {
-  float sample = measureAvoidDistanceCm();
-  if (sample < 0.0f) {
-    logNavigationEvent("sensor initialization failed");
-    return false;
+  measureAvoidDistanceCm();
+  if (g_sensorValid) {
+    return true;
   }
 
-  return true;
+  logNavigationEvent("sensor verification failed; retrying sensor");
+  return recoverUltrasonicSensor() == SENSOR_RECOVERED;
 }
 
-static void publishNavigationStatus()
+static SensorRecoveryResult recoverUltrasonicSensor()
+{
+  const NavigationState previousState = g_navigationState;
+  g_navigationState = NAV_RECOVERING;
+  logNavigationEvent("ultrasonic sensor readings are invalid; retrying while stationary");
+  robot.center();
+
+  for (uint8_t attempt = 0; attempt < kSensorRecoveryReadAttempts; ++attempt) {
+    if (isRobotStopRequested() || Servo_PROGRAM >= 1 ||
+        hasNavigationControlPending() || hasNavigationTargetPending()) {
+      g_navigationState = NAV_PAUSED;
+      return SENSOR_RECOVERY_INTERRUPTED;
+    }
+
+    if (measureAvoidDistanceCm() >= 0.0f && g_sensorValid) {
+      g_invalidSensorCycles = 0;
+      g_navigationState = previousState;
+      logNavigationEvent("ultrasonic sensor recovered");
+      return SENSOR_RECOVERED;
+    }
+
+    if (attempt + 1 < kSensorRecoveryReadAttempts) {
+      delay(kSensorRecoveryRetryDelayMs);
+      handleClient();
+    }
+  }
+
+  g_navigationState = previousState;
+  logNavigationEvent("ultrasonic sensor recovery retries exhausted");
+  return SENSOR_RECOVERY_FAILED;
+}
+
+static void publishNavigationStatus(bool force)
 {
   const uint32_t nowMs = millis();
-  if (nowMs - g_lastTelemetryPublishMs < 500) {
+  if (!force && nowMs - g_lastTelemetryPublishMs < 500) {
     return;
   }
 
   publishNavigationTelemetry(
     navigationStateName(g_navigationState),
+    g_navigationReason,
     g_currentDistanceCm,
     g_distanceTravelledCm,
     (float)countMappedCells() * kMapCellSizeCm * kMapCellSizeCm / 10000.0f,
     g_estimatedHeadingDegrees,
+    g_mapOffsetX,
+    g_mapOffsetY,
     g_recoveryAttempts,
     g_sensorValid,
     g_scanDistancesCm,
@@ -250,6 +341,8 @@ static void recenterMapForPosition(float& x, float& y)
   }
 
   memcpy(g_occupancyGrid, g_shiftedOccupancyGrid, sizeof(g_occupancyGrid));
+  g_mapOffsetX += shiftX;
+  g_mapOffsetY += shiftY;
   g_mapPositionX -= shiftX;
   g_mapPositionY -= shiftY;
   x -= shiftX;
@@ -290,6 +383,8 @@ static void recordEstimatedMovement(float distanceCm)
   }
 
   const float radians = g_estimatedHeadingDegrees * 0.01745329252f;
+  g_worldPositionX += sinf(radians) * distanceCm;
+  g_worldPositionY += cosf(radians) * distanceCm;
   const float startX = g_mapPositionX;
   const float startY = g_mapPositionY;
   const float targetX = startX + sinf(radians) * distanceCm / kMapCellSizeCm;
@@ -313,10 +408,35 @@ static void recordEstimatedMovement(float distanceCm)
   markMapCell((int)lroundf(g_mapPositionX), (int)lroundf(g_mapPositionY), MAP_ROBOT);
 }
 
+static float normalizeHeadingDegrees(float headingDegrees)
+{
+  while (headingDegrees < 0.0f) {
+    headingDegrees += 360.0f;
+  }
+  while (headingDegrees >= 360.0f) {
+    headingDegrees -= 360.0f;
+  }
+  return headingDegrees;
+}
+
+static float signedHeadingErrorDegrees(float targetDegrees, float currentDegrees)
+{
+  float error = normalizeHeadingDegrees(targetDegrees) -
+      normalizeHeadingDegrees(currentDegrees);
+  if (error > 180.0f) {
+    error -= 360.0f;
+  } else if (error < -180.0f) {
+    error += 360.0f;
+  }
+  return error;
+}
+
 static int chooseSafeTurnDirection()
 {
   float leftScore = 0.0f;
   float rightScore = 0.0f;
+  int leftCount = 0;
+  int rightCount = 0;
 
   for (int i = 0; i < g_scanSampleCount; ++i) {
     const SensorScanSample& sample = g_scanSamples[i];
@@ -324,11 +444,22 @@ static int chooseSafeTurnDirection()
       continue;
     }
 
-    if (sample.headingDeg >= 0.0f && sample.headingDeg <= 180.0f) {
+    const float relativeHeading =
+        normalizeHeadingDegrees(sample.headingDeg - g_estimatedHeadingDegrees);
+    if (relativeHeading > 180) {
       leftScore += sample.distanceCm;
+      ++leftCount;
     } else {
       rightScore += sample.distanceCm;
+      ++rightCount;
     }
+  }
+
+  if (leftCount > 0) {
+    leftScore /= leftCount;
+  }
+  if (rightCount > 0) {
+    rightScore /= rightCount;
   }
 
   if (leftScore > rightScore) {
@@ -337,21 +468,30 @@ static int chooseSafeTurnDirection()
   if (rightScore > leftScore) {
     return -1;
   }
-  return g_explorationDirection;
+  return g_laneChangeDirection;
 }
 
-static bool performInitialScan()
+static bool perform360Scan()
 {
-  g_scanSampleCount = 0;
-  memset(g_scanDistancesCm, 0, sizeof(g_scanDistancesCm));
-  float leftScore = 0.0f;
-  float rightScore = 0.0f;
-  int scanSteps = min((int)g_navigationConfig.scanSteps, 36);
+  if (!g_scanInProgress) {
+    g_scanInProgress = true;
+    g_scanReturnState = g_navigationState;
+    g_scanStartHeadingDegrees = g_estimatedHeadingDegrees;
+    g_scanNextStep = 0;
+    g_scanDegreesPerCommandDegree = getRotationCalibrationScale();
+    g_scanCommandDegrees = 360.0f / g_scanDegreesPerCommandDegree;
+    g_scanStepCount = (uint8_t)ceilf(g_scanCommandDegrees / kTurnAngleDegrees);
+    g_scanSampleCount = 0;
+    g_scanLeftScore = 0.0f;
+    g_scanRightScore = 0.0f;
+    g_scanLeftCount = 0;
+    g_scanRightCount = 0;
+    memset(g_scanDistancesCm, 0, sizeof(g_scanDistancesCm));
+    logNavigationEvent("starting calibrated 360-degree scan");
+  }
 
-  logNavigationEvent("starting 360-degree scan");
-  for (int i = 0; i < scanSteps; ++i) {
-    float heading = (float)i * (360.0f / scanSteps);
-    g_estimatedHeadingDegrees = (int)heading;
+  for (int i = g_scanNextStep; i < g_scanStepCount; ++i) {
+    const float heading = g_estimatedHeadingDegrees;
     float currentDistance = measureAvoidDistanceCm();
     SensorScanSample sample;
     sample.headingDeg = heading;
@@ -360,38 +500,203 @@ static bool performInitialScan()
 
     if (sample.valid) {
       g_scanSamples[g_scanSampleCount++] = sample;
-      int mapSector = ((int)(heading / 30.0f)) % 12;
+      const int mapSector = (((int)heading + 15) / 30) % 12;
       g_scanDistancesCm[mapSector] = (uint16_t)min((int)currentDistance, 400);
       mapRangeMeasurement(currentDistance, heading);
-      if (sample.headingDeg <= 180.0f) {
-        leftScore += sample.distanceCm;
+      const float relativeHeading =
+          normalizeHeadingDegrees(heading - g_scanStartHeadingDegrees);
+      if (relativeHeading > 180) {
+        g_scanLeftScore += sample.distanceCm;
+        ++g_scanLeftCount;
       } else {
-        rightScore += sample.distanceCm;
+        g_scanRightScore += sample.distanceCm;
+        ++g_scanRightCount;
       }
     }
 
-    if (i + 1 < scanSteps) {
-      robot.turnleft();
-      g_estimatedHeadingDegrees = ((int)((i + 1) * (360.0f / scanSteps))) % 360;
-      delay(120);
+    const float completedCommandDegrees = i * kTurnAngleDegrees;
+    const float remainingCommandDegrees =
+        g_scanCommandDegrees - completedCommandDegrees;
+    const float turnDegrees = remainingCommandDegrees < kTurnAngleDegrees
+        ? remainingCommandDegrees : kTurnAngleDegrees;
+    if (!performTurnStep(1, turnDegrees,
+            turnDegrees * g_scanDegreesPerCommandDegree)) {
+      return false;
+    }
+    g_scanNextStep = (uint8_t)(i + 1);
+    if (hasNavigationControlPending() || hasNavigationTargetPending()) {
+      return false;
     }
   }
 
   robot.center();
   delay(150);
 
+  g_scanInProgress = false;
   g_initialScanComplete = (g_scanSampleCount > 0);
+  if (g_scanNextStep == g_scanStepCount) {
+    logNavigationEvent("calibrated 360-degree scan completed");
+  }
   if (!g_initialScanComplete) {
+    if (g_navigationState != NAV_INITIAL_SCANNING) {
+      return false;
+    }
     g_navigationState = NAV_ERROR;
     logNavigationEvent("initial scan produced no usable samples");
     return false;
   }
 
-  g_explorationDirection = (leftScore >= rightScore) ? 1 : -1;
-  g_estimatedHeadingDegrees = 0;
-  markMapCell((int)lroundf(g_mapPositionX), (int)lroundf(g_mapPositionY), MAP_ROBOT);
-  g_navigationState = NAV_EXPLORING;
-  logNavigationEvent("initial scan complete");
+  if (g_scanLeftCount > 0) {
+    g_scanLeftScore /= g_scanLeftCount;
+  }
+  if (g_scanRightCount > 0) {
+    g_scanRightScore /= g_scanRightCount;
+  }
+  g_laneChangeDirection =
+      (g_scanLeftScore >= g_scanRightScore) ? 1 : -1;
+  if (g_navigationState == NAV_INITIAL_SCANNING) {
+    markMapCell((int)lroundf(g_mapPositionX), (int)lroundf(g_mapPositionY), MAP_ROBOT);
+    g_navigationState = NAV_EXPLORING;
+    logNavigationEvent("initial scan complete");
+  }
+  return true;
+}
+
+static bool rotateQuarterTurn(int direction)
+{
+  return rotateByDegrees(direction, 90.0f);
+}
+
+static bool rotateByDegrees(int direction, float degrees,
+    int executingProgramId)
+{
+  const float degreesPerCommandDegree = getRotationCalibrationScale();
+  const float commandDegrees = degrees / degreesPerCommandDegree;
+  if (Servo_PROGRAM >= 1 && Servo_PROGRAM != executingProgramId) {
+    return false;
+  }
+  float remainingDegrees = commandDegrees;
+  while (remainingDegrees > 0.001f) {
+    const float stepDegrees = remainingDegrees < kTurnAngleDegrees
+        ? remainingDegrees : kTurnAngleDegrees;
+    if (!performTurnStep(direction, stepDegrees,
+            stepDegrees * degreesPerCommandDegree, executingProgramId)) {
+      return false;
+    }
+    remainingDegrees -= stepDegrees;
+    if (hasNavigationControlPending() || hasNavigationTargetPending() ||
+        (Servo_PROGRAM >= 1 && Servo_PROGRAM != executingProgramId)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool performTurnStep(int direction, float degrees,
+    float estimatedDegrees, int executingProgramId)
+{
+  if (degrees <= 0.0f || degrees > kTurnAngleDegrees) {
+    return false;
+  }
+  if (isRobotStopRequested() ||
+      (Servo_PROGRAM >= 1 && Servo_PROGRAM != executingProgramId)) {
+    return false;
+  }
+  if (direction > 0) {
+    if (degrees >= kTurnAngleDegrees) {
+      robot.turnleft();
+    } else {
+      robot.turnleftFraction(degrees / kTurnAngleDegrees);
+    }
+  } else {
+    if (degrees >= kTurnAngleDegrees) {
+      robot.turnright();
+    } else {
+      robot.turnrightFraction(degrees / kTurnAngleDegrees);
+    }
+  }
+  if (isRobotStopRequested()) {
+    return false;
+  }
+
+  if (estimatedDegrees < 0.0f) {
+    estimatedDegrees = degrees;
+  }
+  g_estimatedHeadingDegrees = normalizeHeadingDegrees(
+      g_estimatedHeadingDegrees +
+      (direction > 0 ? -estimatedDegrees : estimatedDegrees));
+  publishNavigationStatus(true);
+  handleClient();
+  return !isRobotStopRequested() &&
+      (Servo_PROGRAM < 1 || Servo_PROGRAM == executingProgramId);
+}
+
+static bool moveForwardSteps(uint8_t steps, bool countAsLaneProgress,
+    bool checkObstacles)
+{
+  for (uint8_t step = 0; step < steps; ++step) {
+    if (checkObstacles) {
+      const float distanceCm = measureAvoidDistanceCm();
+      if (!g_sensorValid || distanceCm < g_navigationConfig.safeTurnDistanceCm) {
+        robot.center();
+        g_navigationState = NAV_EXPLORING;
+        if (g_sensorValid) {
+          mapRangeMeasurement(distanceCm, g_estimatedHeadingDegrees);
+        }
+        return false;
+      }
+      mapRangeMeasurement(distanceCm, g_estimatedHeadingDegrees);
+    }
+
+    if (isRobotStopRequested() || Servo_PROGRAM >= 1 ||
+        hasNavigationControlPending() || hasNavigationTargetPending()) {
+      return false;
+    }
+    robot.forward();
+    if (isRobotStopRequested()) {
+      return false;
+    }
+    recordEstimatedMovement(kForwardStepDistanceCm);
+    g_distanceTravelledCm += kForwardStepDistanceCm;
+    g_lastMovementCm = kForwardStepDistanceCm;
+    if (countAsLaneProgress && g_laneForwardSteps < UINT8_MAX) {
+      ++g_laneForwardSteps;
+    }
+    handleClient();
+    if (isRobotStopRequested() || Servo_PROGRAM >= 1 ||
+        hasNavigationControlPending() || hasNavigationTargetPending()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool changeLane(int direction, bool reverseFirst)
+{
+  if (reverseFirst) {
+    robot.backward();
+    if (isRobotStopRequested() || Servo_PROGRAM >= 1) {
+      return false;
+    }
+    recordEstimatedMovement(-kForwardStepDistanceCm);
+    g_distanceTravelledCm += kForwardStepDistanceCm;
+    g_lastMovementCm = -kForwardStepDistanceCm;
+    handleClient();
+    if (isRobotStopRequested() || Servo_PROGRAM >= 1 ||
+        hasNavigationControlPending() || hasNavigationTargetPending()) {
+      return false;
+    }
+  }
+  if (!rotateQuarterTurn(direction)) {
+    return false;
+  }
+  g_laneForwardSteps = 0;
+  if (!moveForwardSteps(kLaneSpacingSteps, false, true) ||
+      !rotateQuarterTurn(direction)) {
+    return false;
+  }
+
+  g_laneChangeDirection = -direction;
   return true;
 }
 
@@ -411,23 +716,32 @@ static void triggerRecovery()
   robot.center();
   delay(150);
 
-  const int turnDirection = -g_explorationDirection;
-  if (turnDirection > 0) {
-    robot.turnleft();
-    g_estimatedHeadingDegrees = (g_estimatedHeadingDegrees + kEstimatedTurnAngleDegrees) % 360;
-  } else {
-    robot.turnright();
-    g_estimatedHeadingDegrees = (g_estimatedHeadingDegrees + 360 - kEstimatedTurnAngleDegrees) % 360;
+  if (!perform360Scan()) {
+    if (hasNavigationControlPending()) {
+      return;
+    }
+    robot.center();
+    g_navigationState = NAV_PAUSED;
+    logNavigationEvent("recovery scan failed; autonomous navigation paused");
+    return;
   }
 
-  g_explorationDirection = turnDirection;
+  const int turnDirection = chooseSafeTurnDirection();
+  if (!changeLane(turnDirection, true)) {
+    return;
+  }
   g_blockedCycles = 0;
   g_navigationState = NAV_EXPLORING;
-  logNavigationEvent("recovery heading selected");
+  logNavigationEvent("recovery lane change complete");
 }
 
 static void updateAutonomousNavigation()
 {
+  if (g_navigationState == NAV_TARGETING) {
+    updateTargetNavigation();
+    return;
+  }
+
   if (g_navigationState == NAV_STARTUP_DELAY) {
     if (millis() >= g_startupDeadlineMs) {
       g_autonomousEnabled = true;
@@ -443,7 +757,7 @@ static void updateAutonomousNavigation()
   }
 
   if (g_navigationState == NAV_INITIAL_SCANNING) {
-    performInitialScan();
+    perform360Scan();
     return;
   }
 
@@ -451,8 +765,20 @@ static void updateAutonomousNavigation()
     float obstacleDistance = measureAvoidDistanceCm();
     if (!g_sensorValid || obstacleDistance <= 0.0f) {
       robot.center();
+      if (g_invalidSensorCycles < UINT8_MAX) {
+        ++g_invalidSensorCycles;
+      }
+      if (g_invalidSensorCycles >= kMaxInvalidSensorCycles) {
+        const SensorRecoveryResult recoveryResult = recoverUltrasonicSensor();
+        if (recoveryResult == SENSOR_RECOVERY_FAILED) {
+          g_autonomousEnabled = false;
+          g_navigationState = NAV_ERROR;
+          logNavigationEvent("sensor recovery failed; autonomous navigation stopped");
+        }
+      }
       return;
     }
+    g_invalidSensorCycles = 0;
 
     if (obstacleDistance < g_navigationConfig.safeTurnDistanceCm) {
       if (g_blockedCycles < UINT8_MAX) {
@@ -467,18 +793,12 @@ static void updateAutonomousNavigation()
       return;
     }
 
-    g_blockedCycles = 0;
-    g_recoveryAttempts = 0;
-
-    robot.forward();
-    recordEstimatedMovement(8.0f);
-    g_distanceTravelledCm += 8.0f;
-    g_lastMovementCm = 8.0f;
-
-    static uint8_t sweepCounter = 0;
-    ++sweepCounter;
-    if (sweepCounter >= 3) {
-      sweepCounter = 0;
+    if (!moveForwardSteps(1, true)) {
+      return;
+    }
+    if (g_laneForwardSteps >= kLaneLengthSteps) {
+      g_blockedCycles = 0;
+      g_recoveryAttempts = 0;
       g_navigationState = NAV_REPOSITIONING;
     }
     return;
@@ -487,26 +807,29 @@ static void updateAutonomousNavigation()
   if (g_navigationState == NAV_AVOIDING_OBSTACLE) {
     robot.center();
     delay(120);
-    if (chooseSafeTurnDirection() > 0) {
-      robot.turnleft();
-      g_estimatedHeadingDegrees = (g_estimatedHeadingDegrees + kEstimatedTurnAngleDegrees) % 360;
-    } else {
-      robot.turnright();
-      g_estimatedHeadingDegrees = (g_estimatedHeadingDegrees + 360 - kEstimatedTurnAngleDegrees) % 360;
+    if (!perform360Scan()) {
+      if (Servo_PROGRAM >= 1 || isRobotStopRequested() ||
+          hasNavigationControlPending()) {
+        return;
+      }
+      robot.center();
+      g_navigationState = NAV_PAUSED;
+      logNavigationEvent("obstacle scan failed; autonomous navigation paused");
+      return;
+    }
+    const int turnDirection = chooseSafeTurnDirection();
+    g_laneChangeDirection = turnDirection;
+    if (!changeLane(turnDirection, false)) {
+      return;
     }
     g_navigationState = NAV_EXPLORING;
     return;
   }
 
   if (g_navigationState == NAV_REPOSITIONING) {
-    if (g_explorationDirection > 0) {
-      robot.turnleft();
-      g_estimatedHeadingDegrees = (g_estimatedHeadingDegrees + kEstimatedTurnAngleDegrees) % 360;
-    } else {
-      robot.turnright();
-      g_estimatedHeadingDegrees = (g_estimatedHeadingDegrees + 360 - kEstimatedTurnAngleDegrees) % 360;
+    if (!changeLane(g_laneChangeDirection, false)) {
+      return;
     }
-    g_explorationDirection *= -1;
     g_navigationState = NAV_EXPLORING;
     return;
   }
@@ -515,6 +838,314 @@ static void updateAutonomousNavigation()
     g_navigationState = NAV_EXPLORING;
     return;
   }
+}
+
+static void processNavigationTarget()
+{
+  if (g_navigationState == NAV_STARTUP_DELAY &&
+      millis() < g_startupDeadlineMs) {
+    return;
+  }
+  if (Servo_PROGRAM >= 1) {
+    return;
+  }
+
+  NavigationWaypoint requestedWaypoints[MAX_NAVIGATION_WAYPOINTS];
+  uint8_t count = 0;
+  const NavigationTargetKind kind =
+      takeNavigationTarget(requestedWaypoints, count);
+  if (kind == NAV_TARGET_NONE) {
+    return;
+  }
+
+  robot.center();
+  measureAvoidDistanceCm();
+  if (!g_sensorValid && recoverUltrasonicSensor() != SENSOR_RECOVERED) {
+    g_autonomousEnabled = false;
+    g_targetNavigationActive = false;
+    g_navigationState = NAV_ERROR;
+    logNavigationEvent("target rejected; ultrasonic sensor unavailable");
+    return;
+  }
+
+  if (kind == NAV_TARGET_HOME) {
+    requestedWaypoints[0].xCm = 0.0f;
+    requestedWaypoints[0].yCm = 0.0f;
+    requestedWaypoints[0].animationId = PROGRAM_NONE;
+    count = 1;
+  }
+  if (count == 0 || count > MAX_NAVIGATION_WAYPOINTS) {
+    logNavigationEvent("target rejected; invalid waypoint count");
+    return;
+  }
+
+  memcpy(g_activeWaypoints, requestedWaypoints,
+      count * sizeof(g_activeWaypoints[0]));
+  g_activeWaypointCount = count;
+  g_activeWaypointIndex = 0;
+  g_targetNavigationActive = true;
+  g_activeTargetKind = kind;
+  g_targetDetourActive = false;
+  g_autonomousEnabled = true;
+  g_blockedCycles = 0;
+  g_recoveryAttempts = 0;
+  g_invalidSensorCycles = 0;
+  g_navigationState = NAV_TARGETING;
+  logNavigationEvent(kind == NAV_TARGET_HOME
+      ? "return-home target accepted"
+      : kind == NAV_TARGET_ROUTE ? "waypoint route accepted"
+      : "go-to target accepted");
+}
+
+static void updateTargetNavigation()
+{
+  if (!g_targetNavigationActive || g_activeWaypointIndex >= g_activeWaypointCount) {
+    robot.center();
+    g_targetNavigationActive = false;
+    g_activeTargetKind = NAV_TARGET_NONE;
+    g_autonomousEnabled = false;
+    g_navigationState = NAV_PAUSED;
+    logNavigationEvent("target navigation stopped; no active waypoint");
+    return;
+  }
+  if (isRobotStopRequested() || Servo_PROGRAM >= 1 ||
+      hasNavigationControlPending() || hasNavigationTargetPending()) {
+    robot.center();
+    return;
+  }
+
+  const float obstacleDistance = measureAvoidDistanceCm();
+  handleClient();
+  if (isRobotStopRequested() || Servo_PROGRAM >= 1 ||
+      hasNavigationControlPending() || hasNavigationTargetPending()) {
+    return;
+  }
+  if (!g_sensorValid || obstacleDistance <= 0.0f) {
+    robot.center();
+    if (g_invalidSensorCycles < UINT8_MAX) {
+      ++g_invalidSensorCycles;
+    }
+    if (g_invalidSensorCycles >= kMaxInvalidSensorCycles) {
+      const SensorRecoveryResult result = recoverUltrasonicSensor();
+      if (result == SENSOR_RECOVERY_FAILED) {
+        g_autonomousEnabled = false;
+        g_targetNavigationActive = false;
+        g_navigationState = NAV_ERROR;
+        logNavigationEvent("target navigation stopped; sensor recovery failed");
+      }
+    }
+    return;
+  }
+  g_invalidSensorCycles = 0;
+  mapRangeMeasurement(obstacleDistance, g_estimatedHeadingDegrees);
+
+  const NavigationWaypoint& target = g_activeWaypoints[g_activeWaypointIndex];
+  const float deltaX = target.xCm - g_worldPositionX;
+  const float deltaY = target.yCm - g_worldPositionY;
+  const float distanceToTarget = sqrtf(deltaX * deltaX + deltaY * deltaY);
+  if (distanceToTarget <= kForwardStepDistanceCm) {
+    const int animationId = g_activeWaypoints[g_activeWaypointIndex].animationId;
+    g_activeWaypoints[g_activeWaypointIndex].animationId = PROGRAM_NONE;
+    if (animationId != PROGRAM_NONE) {
+      robot.center();
+      runRobotProgram(animationId);
+      if (isRobotStopRequested() || Servo_PROGRAM >= 1) {
+        return;
+      }
+      handleClient();
+      if (isRobotStopRequested() || Servo_PROGRAM >= 1 ||
+          hasNavigationControlPending() || hasNavigationTargetPending()) {
+        return;
+      }
+    }
+    ++g_activeWaypointIndex;
+    if (g_activeWaypointIndex < g_activeWaypointCount) {
+      return;
+    }
+
+    robot.center();
+    g_targetNavigationActive = false;
+    if (g_activeTargetKind == NAV_TARGET_POINT && animationId != PROGRAM_NONE) {
+      g_autonomousEnabled = true;
+      g_navigationState = NAV_INITIAL_SCANNING;
+      logNavigationEvent("destination animation complete; resuming autonomous coverage");
+    } else {
+      g_autonomousEnabled = false;
+      g_navigationState = NAV_PAUSED;
+      logNavigationEvent("destination reached; navigation paused");
+    }
+    g_activeTargetKind = NAV_TARGET_NONE;
+    return;
+  }
+
+  const float targetHeading = g_targetDetourActive
+      ? g_targetDetourHeading
+      : atan2f(deltaX, deltaY) * 57.2957795f;
+  const float headingError =
+      signedHeadingErrorDegrees(targetHeading, g_estimatedHeadingDegrees);
+  if (fabsf(headingError) > 0.5f &&
+      !rotateByDegrees(headingError > 0.0f ? -1 : 1, fabsf(headingError))) {
+    return;
+  }
+
+  if (obstacleDistance <= g_navigationConfig.safeTurnDistanceCm) {
+    robot.center();
+    if (g_recoveryAttempts < UINT8_MAX) {
+      ++g_recoveryAttempts;
+    }
+    if (g_recoveryAttempts > g_navigationConfig.maxRecoveryAttempts) {
+      g_autonomousEnabled = false;
+      g_targetNavigationActive = false;
+      g_activeTargetKind = NAV_TARGET_NONE;
+      g_activeTargetKind = NAV_TARGET_NONE;
+      g_navigationState = NAV_STOPPED;
+      requestRobotStop(PROGRAM_STANDBY);
+      logNavigationEvent("target blocked; recovery limit reached and robot stopped");
+      return;
+    }
+
+    if (!perform360Scan()) {
+      if (isRobotStopRequested() || Servo_PROGRAM >= 1 ||
+          hasNavigationControlPending() || hasNavigationTargetPending()) {
+        return;
+      }
+      g_autonomousEnabled = false;
+      g_targetNavigationActive = false;
+      g_navigationState = NAV_PAUSED;
+      logNavigationEvent("target obstacle scan failed; navigation paused");
+      return;
+    }
+
+    float bestHeadingError = 181.0f;
+    float bestHeading = -1.0f;
+    for (int i = 0; i < g_scanSampleCount; ++i) {
+      const SensorScanSample& sample = g_scanSamples[i];
+      if (!sample.valid ||
+          sample.distanceCm < g_navigationConfig.safeTurnDistanceCm + 5.0f) {
+        continue;
+      }
+      const float candidateHeading = normalizeHeadingDegrees(sample.headingDeg);
+      const float desiredHeading = atan2f(deltaX, deltaY) * 57.2957795f;
+      const float error = fabsf(
+          signedHeadingErrorDegrees(candidateHeading, desiredHeading));
+      if (error < bestHeadingError) {
+        bestHeadingError = error;
+        bestHeading = candidateHeading;
+      }
+    }
+    if (bestHeading < 0) {
+      const int turnDirection = chooseSafeTurnDirection();
+      bestHeading = normalizeHeadingDegrees(g_estimatedHeadingDegrees +
+          (turnDirection > 0 ? 270.0f : 90.0f));
+    }
+    g_targetDetourActive = true;
+    g_targetDetourHeading = bestHeading;
+    const float detourError = signedHeadingErrorDegrees(
+        g_targetDetourHeading, g_estimatedHeadingDegrees);
+    if (fabsf(detourError) > 0.5f &&
+        !rotateByDegrees(detourError > 0.0f ? -1 : 1,
+            fabsf(detourError))) {
+      return;
+    }
+    return;
+  }
+
+  if (isRobotStopRequested() || Servo_PROGRAM >= 1 ||
+      hasNavigationControlPending() || hasNavigationTargetPending()) {
+    return;
+  }
+  robot.forward();
+  if (isRobotStopRequested()) {
+    return;
+  }
+  recordEstimatedMovement(kForwardStepDistanceCm);
+  g_distanceTravelledCm += kForwardStepDistanceCm;
+  g_lastMovementCm = kForwardStepDistanceCm;
+  g_targetDetourActive = false;
+  g_recoveryAttempts = 0;
+  g_blockedCycles = 0;
+  handleClient();
+}
+
+static void processNavigationControl()
+{
+  const NavigationControl control = takeNavigationControl();
+  if (control == NAV_CONTROL_NONE) {
+    return;
+  }
+
+  if (Servo_PROGRAM >= 1) {
+    logNavigationEvent("navigation command skipped because manual action is pending");
+    return;
+  }
+
+  if (control == NAV_CONTROL_PAUSE) {
+    clearRobotStopRequest();
+    robot.center();
+    g_autonomousEnabled = false;
+    g_navigationState = NAV_PAUSED;
+    logNavigationEvent("autonomous navigation paused by user");
+    return;
+  }
+
+  clearRobotStopRequest();
+
+  if (control == NAV_CONTROL_RESTART) {
+    robot.center();
+    g_scanInProgress = false;
+    g_scanNextStep = 0;
+    memset(g_occupancyGrid, MAP_UNKNOWN, sizeof(g_occupancyGrid));
+    memset(g_scanDistancesCm, 0, sizeof(g_scanDistancesCm));
+    g_mapPositionX = kMapOriginX;
+    g_mapPositionY = kMapOriginY;
+    g_mapOffsetX = (int)lroundf(g_worldPositionX / kMapCellSizeCm) - kMapOriginX;
+    g_mapOffsetY = (int)lroundf(-g_worldPositionY / kMapCellSizeCm) - kMapOriginY;
+    g_targetNavigationActive = false;
+    g_targetDetourActive = false;
+    g_activeWaypointCount = 0;
+    g_distanceTravelledCm = 0.0f;
+    g_lastMovementCm = 0.0f;
+    g_recoveryAttempts = 0;
+    g_blockedCycles = 0;
+    g_invalidSensorCycles = 0;
+    g_laneForwardSteps = 0;
+    g_initialScanComplete = false;
+    g_laneChangeDirection = 1;
+    markMapCell(kMapOriginX, kMapOriginY, MAP_ROBOT);
+  } else {
+    robot.center();
+  }
+
+  measureAvoidDistanceCm();
+  if (!g_sensorValid &&
+      recoverUltrasonicSensor() != SENSOR_RECOVERED) {
+    g_autonomousEnabled = false;
+    g_navigationState = NAV_ERROR;
+    logNavigationEvent("navigation resume failed; ultrasonic sensor unavailable");
+    return;
+  }
+
+  g_recoveryAttempts = 0;
+  g_blockedCycles = 0;
+  g_invalidSensorCycles = 0;
+  g_laneForwardSteps = 0;
+  if (control == NAV_CONTROL_RESUME && g_scanInProgress) {
+    g_autonomousEnabled = true;
+    g_navigationState = g_scanReturnState;
+    logNavigationEvent("resuming interrupted scan at its remaining turn steps");
+    return;
+  }
+  if (control == NAV_CONTROL_RESUME && g_targetNavigationActive) {
+    g_autonomousEnabled = true;
+    g_navigationState = NAV_TARGETING;
+    logNavigationEvent("target navigation resumed");
+    return;
+  }
+  g_autonomousEnabled = true;
+  g_navigationState = NAV_INITIAL_SCANNING;
+  logNavigationEvent(control == NAV_CONTROL_RESTART
+      ? "autonomous navigation restarted"
+      : "autonomous navigation resumed; rescanning surroundings");
 }
 
 // Board startup order:
@@ -578,6 +1209,8 @@ void loop()
       DEBUG_PRINTLN(getActionLabel(programId));
       g_autonomousEnabled = false;
       g_navigationState = NAV_PAUSED;
+      g_scanInProgress = false;
+      g_scanNextStep = 0;
       runRobotProgram(programId);
     }
 
@@ -586,6 +1219,8 @@ void loop()
   }
 
   handleClient();
+  processNavigationControl();
+  processNavigationTarget();
 
   if (isRobotStopRequested() && !isRobotBusy()) {
     const int stopTargetProgram = getRobotStopTargetProgram();
@@ -608,6 +1243,8 @@ void loop()
     DEBUG_PRINTLN(getActionLabel(Servo_PROGRAM));
     g_autonomousEnabled = false;
     g_navigationState = NAV_PAUSED;
+    g_scanInProgress = false;
+    g_scanNextStep = 0;
     const int requestedProgram = Servo_PROGRAM;
     runRobotProgram(requestedProgram);
     if (Servo_PROGRAM == requestedProgram) {
@@ -655,7 +1292,7 @@ static float measureAvoidDistanceCm()
     mapRangeMeasurement(measuredDistanceCm, g_estimatedHeadingDegrees);
   }
   if (g_sensorValid && g_initialScanComplete) {
-    int mapSector = ((g_estimatedHeadingDegrees + 15) / 30) % 12;
+    int mapSector = ((int)lroundf(g_estimatedHeadingDegrees + 15.0f) / 30) % 12;
     g_scanDistancesCm[mapSector] = (uint16_t)min((int)measuredDistanceCm, 400);
   }
   return measuredDistanceCm;
@@ -672,10 +1309,15 @@ void Avoid(void)
     if (distance < AVOIDDIS && distance > 0) {
       robot.center();
       delay(100);
-      robot.turnleft();
-      robot.turnleft();
+      rotateByDegrees(1, 2.0f * kTurnAngleDegrees, PROGRAM_AVOID);
     } else if (distance >= AVOIDDIS) {
       robot.forward();
+      if (isRobotStopRequested()) {
+        break;
+      }
+      recordEstimatedMovement(kForwardStepDistanceCm);
+      g_distanceTravelledCm += kForwardStepDistanceCm;
+      g_lastMovementCm = kForwardStepDistanceCm;
     }
 
     handleClient();
@@ -818,10 +1460,10 @@ static void runRobotProgram(int programId)
       robot.rightshift();
       break;
     case PROGRAM_TURNLEFT:
-      robot.turnleft();
+      rotateByDegrees(1, kTurnAngleDegrees, programId);
       break;
     case PROGRAM_TURNRIGHT:
-      robot.turnright();
+      rotateByDegrees(-1, kTurnAngleDegrees, programId);
       break;
     case PROGRAM_LIE:
       robot.lie();
@@ -858,6 +1500,16 @@ static void runRobotProgram(int programId)
       break;
     default:
       break;
+  }
+
+  if (!isRobotStopRequested()) {
+    if (programId == PROGRAM_FORWARD || programId == PROGRAM_BACKWARD) {
+      const float movementCm = programId == PROGRAM_FORWARD
+          ? kForwardStepDistanceCm : -kForwardStepDistanceCm;
+      recordEstimatedMovement(movementCm);
+      g_distanceTravelledCm += kForwardStepDistanceCm;
+      g_lastMovementCm = movementCm;
+    }
   }
 
   if (isRobotStopRequested()) {
