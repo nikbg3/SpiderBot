@@ -800,6 +800,7 @@ static void updateAutonomousNavigation()
       g_blockedCycles = 0;
       g_recoveryAttempts = 0;
       g_navigationState = NAV_REPOSITIONING;
+      logNavigationEvent("coverage lane complete; shifting to the next lane");
     }
     return;
   }

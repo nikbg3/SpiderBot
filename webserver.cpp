@@ -247,12 +247,13 @@ input[type=number]{width:68px;padding:6px 4px;border-radius:8px;border:1px solid
         <button class="set-btn" onclick="saveSteeringCorrection()">SET</button>
       </div>
       <div class="panel-title">Turn calibration</div>
-      <p class="hint">Enter the measured angle after commanding one full 360&deg; turn. This single scale calibrates turns of every requested size, including manual turns, navigation, fractional turns, and scans.</p>
+      <p class="hint">Enter the physical angle you measured after the latest 360&deg; command. Each save refines the existing correction using the measured result, so you can repeat the test after saving. The correction applies equally to left and right turns and assumes both directions behave similarly.</p>
       <div class="steering-calibration">
-        <label for="rotation360Observed">Observed after 360&deg; command</label>
+        <label for="rotation360Observed">Measured angle</label>
         <input type="number" id="rotation360Observed" min="300" max="420" step="1" value="360">
         <span>deg</span>
       </div>
+      <div id="rotationCalibrationCurrent" class="hint" aria-live="polite">Current effective calibration: 360&deg; per commanded 360&deg;</div>
       <button class="wide-btn" onclick="saveRotationCalibration()">Save universal turn calibration</button>
       <button class="wide-btn" onclick="pm(100)">Go To Zero Pose</button>
       <div class="hint">Offset range: -30 to +30 is recommended for quick calibration.</div>
@@ -408,7 +409,9 @@ function describeNavigationChange(nav){
       return 'Obstacle ahead at ' + (nav.distance_cm > 0 ? Math.round(nav.distance_cm) + ' centimeters. ' : '') +
         'I am looking for a safer direction.';
     case 'REPOSITIONING':
-      return 'This route is blocked, so I am repositioning to find another way around.';
+      if(reason.indexOf('coverage lane complete') >= 0)
+        return 'Coverage lane complete. I am shifting over to start the next lane.';
+      return 'I am repositioning to continue navigation.';
     case 'RECOVERING':
       return 'I am recovering from a blocked or uncertain path. Attempt ' +
         nav.recovery_attempts + '.';
@@ -737,7 +740,8 @@ function openCal(){
         throw new Error(steering.message || 'Invalid steering calibration response');
       }
       if(!rotation.ok || !rotation.data ||
-          typeof rotation.data.observed_360_degrees !== 'number'){
+          typeof rotation.data.observed_360_degrees !== 'number' ||
+          typeof rotation.data.calibration_equivalent_degrees !== 'number'){
         throw new Error(rotation.message || 'Invalid turn calibration response');
       }
       for (var i = 0; i < 8; i++) {
@@ -747,6 +751,10 @@ function openCal(){
         steering.data.degrees_per_meter;
       document.getElementById('rotation360Observed').value =
         rotation.data.observed_360_degrees;
+      document.getElementById('rotationCalibrationCurrent').textContent =
+        'Current effective calibration: ' +
+        rotation.data.calibration_equivalent_degrees +
+        '° per commanded 360°';
       document.getElementById('overlay').classList.add('show');
     }).catch(function(error){
       showNavigationNotice(error.message, true);
@@ -786,9 +794,21 @@ function saveRotationCalibration(){
   }).then(function(response){ return response.json(); })
     .then(function(response){
       if(!response.ok) throw new Error(response.message || 'Could not save turn calibration');
+      if(!response.data ||
+          typeof response.data.observed_360_degrees !== 'number' ||
+          typeof response.data.calibration_equivalent_degrees !== 'number'){
+        throw new Error('Invalid turn calibration response');
+      }
+      document.getElementById('rotation360Observed').value =
+        response.data.observed_360_degrees;
+      document.getElementById('rotationCalibrationCurrent').textContent =
+        'Current effective calibration: ' +
+        response.data.calibration_equivalent_degrees +
+        '° per commanded 360°';
       showNavigationNotice(
-        'Universal turn calibration saved: 360° command -> ' +
-        response.data.observed_360_degrees + '° measured');
+        'Turn calibration refined from ' + response.data.observed_360_degrees +
+        '° measured; effective calibration is now ' +
+        response.data.calibration_equivalent_degrees + '°');
     }).catch(function(error){
       showNavigationNotice(error.message, true);
     });
@@ -844,6 +864,9 @@ static const int8_t kDefaultForwardSteeringCorrection = 30;
 static const int kRotation360ValueAddress = 12;
 static const int kRotationCalibrationMarkerAddress = 14;
 static const uint8_t kRotationCalibrationMarker = 0xD3;
+static const int kRotationObservedValueAddress = 10;
+static const int kRotationObservedMarkerAddress = 15;
+static const uint8_t kRotationObservedMarker = 0xD4;
 static const uint16_t kDefaultObserved360Degrees = 360;
 
 int8_t getForwardSteeringCorrection()
@@ -881,18 +904,29 @@ static void writeEepromUint16(int address, uint16_t value)
 
 uint16_t getObserved360RotationDegrees()
 {
+    if (EEPROM.read(kRotationObservedMarkerAddress) !=
+        kRotationObservedMarker) {
+        return kDefaultObserved360Degrees;
+    }
+    const uint16_t value = readEepromUint16(kRotationObservedValueAddress);
+    return value >= 300 && value <= 420
+        ? value : kDefaultObserved360Degrees;
+}
+
+uint16_t getRotationCalibrationEquivalentDegrees()
+{
     if (EEPROM.read(kRotationCalibrationMarkerAddress) !=
         kRotationCalibrationMarker) {
         return kDefaultObserved360Degrees;
     }
     const uint16_t value = readEepromUint16(kRotation360ValueAddress);
-    return value >= 300 && value <= 420
+    return value >= 250 && value <= 490
         ? value : kDefaultObserved360Degrees;
 }
 
 float getRotationCalibrationScale()
 {
-    return (float)getObserved360RotationDegrees() / 360.0f;
+    return (float)getRotationCalibrationEquivalentDegrees() / 360.0f;
 }
 
 bool setObserved360RotationDegrees(uint16_t observed360)
@@ -900,9 +934,18 @@ bool setObserved360RotationDegrees(uint16_t observed360)
     if (observed360 < 300 || observed360 > 420) {
         return false;
     }
-    writeEepromUint16(kRotation360ValueAddress, observed360);
+    const uint16_t currentEquivalent =
+        getRotationCalibrationEquivalentDegrees();
+    const uint16_t updatedEquivalent = (uint16_t)lroundf(
+        (float)currentEquivalent * observed360 / 360.0f);
+    if (updatedEquivalent < 250 || updatedEquivalent > 490) {
+        return false;
+    }
+    writeEepromUint16(kRotation360ValueAddress, updatedEquivalent);
     EEPROM.write(kRotationCalibrationMarkerAddress,
         kRotationCalibrationMarker);
+    writeEepromUint16(kRotationObservedValueAddress, observed360);
+    EEPROM.write(kRotationObservedMarkerAddress, kRotationObservedMarker);
     return EEPROM.commit();
 }
 
@@ -1810,6 +1853,8 @@ static void handleApiRotationCalibrationGet()
 {
     String data = "{\"observed_360_degrees\":";
     data += String(getObserved360RotationDegrees());
+    data += ",\"calibration_equivalent_degrees\":";
+    data += String(getRotationCalibrationEquivalentDegrees());
     data += "}";
     sendJsonResponse(200, true, 0, "OK", data);
 }
@@ -1832,6 +1877,8 @@ static void handleApiRotationCalibrationPost()
 
     String data = "{\"observed_360_degrees\":";
     data += String(getObserved360RotationDegrees());
+    data += ",\"calibration_equivalent_degrees\":";
+    data += String(getRotationCalibrationEquivalentDegrees());
     data += "}";
     sendJsonResponse(200, true, 0, "saved", data);
 }

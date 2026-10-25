@@ -89,6 +89,7 @@ int8_t readKeyValue(int8_t key);
 int8_t getForwardSteeringCorrection();
 bool setForwardSteeringCorrection(int degreesPerMeter);
 uint16_t getObserved360RotationDegrees();
+uint16_t getRotationCalibrationEquivalentDegrees();
 bool setObserved360RotationDegrees(uint16_t observed360);
 float getRotationCalibrationScale();
 const RobotActionInfo* getRobotActions(size_t& count);
