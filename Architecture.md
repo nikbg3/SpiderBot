@@ -141,8 +141,10 @@ constraints; attached peripherals must not force them into invalid boot levels.
 
 The AP name includes the last two bytes of the ESP's MAC address. The AP
 credential is configured in firmware. The dashboard and API are served
-directly from the device; there is no external web server or build-time web
-asset pipeline.
+directly from the device. The dashboard markup is kept in
+[`dashboard_html.h`](./dashboard_html.h) as a compile-time `PROGMEM` string
+included by `webserver.cpp`; editing the page requires rebuilding and
+reflashing the firmware, but does not require a separate filesystem upload.
 
 ### 4.2 Main loop and action dispatch
 
