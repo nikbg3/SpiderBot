@@ -124,7 +124,7 @@ input[type=number]{width:68px;padding:6px 4px;border-radius:8px;border:1px solid
         <span class="nav-legend-item"><i class="nav-swatch" style="background:#4f46e5"></i>Robot</span>
         <span class="nav-legend-item"><i class="nav-swatch" style="background:#22c55e"></i>Home</span>
       </div>
-      <div class="nav-note">Right-click the map (or long-press on touch) for Go here, animations, routes, pause/resume, and Return to home. Route points can be added with an animation; the robot plays it and continues, pausing at the final point. A single animated destination resumes coverage after the animation. Coverage uses 8 cm forward steps and 18.70&deg; turns, with a scaled final gait for exact 90&deg;, 180&deg;, and 360&deg; rotations. Map targets stay anchored as the map recenters.</div>
+      <div class="nav-note">Right-click the map (or long-press on touch) for Go here, animations, routes, pause/resume, and Return to home. Route points can be added with an animation; the robot plays it and continues, pausing at the final point. A single animated destination resumes coverage after the animation. All scanning and movement turns use complete turn gaits. Coverage follows 8 cm serpentine lanes spaced one step apart. The mini-map grows with observed area up to its firmware limit; unknown cells mean unobserved, not clear. Map targets stay anchored as the map recenters.</div>
     </div>
 
     <div class="panel">
@@ -186,17 +186,17 @@ input[type=number]{width:68px;padding:6px 4px;border-radius:8px;border:1px solid
         </tbody>
       </table>
       <div class="panel-title">Forward steering correction</div>
-      <p class="hint">Positive values counter left drift; negative values counter right drift. Enter degrees of drift per meter. For a 45&deg; left drift over 1.5 m, start at +30&deg;/m. Saved settings persist and apply on the next forward gait.</p>
+      <p class="hint">Correction is applied during the forward gait by changing left/right foot-swing stride, not by adding a turn afterward. Positive values increase left stride and reduce right stride to counter left drift; negative values do the reverse. Enter measured drift in degrees per meter (-360 to 360). Stride bias is capped for safety, so large values eventually reach the same maximum. This is open-loop and cannot sense heading.</p>
       <div class="steering-calibration">
         <label for="steeringCorrection">Drift (degrees per meter)</label>
-        <input type="number" id="steeringCorrection" min="-90" max="90" step="1" value="30">
+        <input type="number" id="steeringCorrection" value="30">
         <button class="set-btn" onclick="saveSteeringCorrection()">SET</button>
       </div>
       <div class="panel-title">Turn calibration</div>
-      <p class="hint">Enter the physical angle you measured after the latest 360&deg; command. Each save refines the existing correction using the measured result, so you can repeat the test after saving. The correction applies equally to left and right turns and assumes both directions behave similarly.</p>
+      <p class="hint">Enter the physical angle the robot actually turned after a 360&deg; command (for example, 45, 180, 360, 450, 720, or 1935). Calibration accounts for the number of complete gait steps used, so run another 360&deg; test after saving to refine it. The correction applies equally to left and right turns and assumes both directions behave similarly. All turns use complete turn gaits.</p>
       <div class="steering-calibration">
         <label for="rotation360Observed">Measured angle</label>
-        <input type="number" id="rotation360Observed" min="300" max="420" step="1" value="360">
+        <input type="number" id="rotation360Observed" value="360">
         <span>deg</span>
       </div>
       <div id="rotationCalibrationCurrent" class="hint" aria-live="polite">Current effective calibration: 360&deg; per commanded 360&deg;</div>
@@ -370,6 +370,8 @@ function describeNavigationChange(nav){
         ? 'Destination reached. I am paused and waiting for your next instruction.'
         : 'Navigation is paused. I am holding position and waiting for you.';
     case 'STOPPED':
+      if(reason.indexOf('coverage complete') >= 0)
+        return 'I have finished the reachable zig-zag coverage and stopped at the room boundary.';
       return 'I have stopped because recovery did not find a safe path. Please check my surroundings.';
     case 'ERROR':
       return 'I have encountered a navigation problem. ' +
@@ -384,10 +386,9 @@ function announceNavigationState(nav){
   lastSpokenNavigationUpdate = updateKey;
   speakNavigationMessage(describeNavigationChange(nav));
 }
-function drawNavMap(grid, heading, mapOffsetX, mapOffsetY){
+function drawNavMap(grid, width, heading, mapOffsetX, mapOffsetY){
   var canvas = document.getElementById('navMap');
   var ctx = canvas.getContext('2d');
-  var width = 31;
   if(typeof grid !== 'string' || grid.length !== width * width) return;
   var cellSize = canvas.width / width;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -502,7 +503,8 @@ function updateNavigation(){
       document.getElementById('navHeading').textContent = nav.heading_deg;
       document.getElementById('navRecovery').textContent = nav.recovery_attempts;
       latestNavigation = nav;
-      drawNavMap(nav.grid, nav.heading_deg, nav.map_offset_x, nav.map_offset_y);
+      drawNavMap(nav.grid, nav.map_width, nav.heading_deg,
+        nav.map_offset_x, nav.map_offset_y);
     })
     .catch(function(){ showNavigationNotice('Telemetry unavailable; check the Wi-Fi connection', true); });
 }
@@ -511,9 +513,10 @@ function mapPointFromEvent(event){
   if(!latestNavigation) return null;
   var canvas = document.getElementById('navMap');
   var rect = canvas.getBoundingClientRect();
-  var x = Math.floor((event.clientX - rect.left) * 31 / rect.width);
-  var y = Math.floor((event.clientY - rect.top) * 31 / rect.height);
-  if(x < 0 || x >= 31 || y < 0 || y >= 31) return null;
+  var width = latestNavigation.map_width;
+  var x = Math.floor((event.clientX - rect.left) * width / rect.width);
+  var y = Math.floor((event.clientY - rect.top) * width / rect.height);
+  if(x < 0 || x >= width || y < 0 || y >= width) return null;
   return {
     x: (x + latestNavigation.map_offset_x) * latestNavigation.cell_size_cm,
     y: -(y + latestNavigation.map_offset_y) * latestNavigation.cell_size_cm
@@ -600,7 +603,8 @@ function mapMenuAction(action, animationId){
       animationId: action === 'add-route-animation' ? animationId : 0
     });
     showNavigationNotice('Route point ' + plannedRoute.length + ' added');
-    if(latestNavigation) drawNavMap(latestNavigation.grid, latestNavigation.heading_deg,
+    if(latestNavigation) drawNavMap(latestNavigation.grid,
+      latestNavigation.map_width, latestNavigation.heading_deg,
       latestNavigation.map_offset_x, latestNavigation.map_offset_y);
   } else if(action === 'cancel'){
     drawingRoute = false; plannedRoute = []; updateNavigation();
@@ -655,7 +659,8 @@ navigationMapCanvas.addEventListener('click', function(event){
   }
   point.animationId = 0;
   plannedRoute.push(point);
-  drawNavMap(latestNavigation.grid, latestNavigation.heading_deg,
+  drawNavMap(latestNavigation.grid, latestNavigation.map_width,
+    latestNavigation.heading_deg,
     latestNavigation.map_offset_x, latestNavigation.map_offset_y);
 });
 document.addEventListener('pointerdown', function(event){
@@ -708,11 +713,6 @@ function openCal(){
 }
 function saveSteeringCorrection(){
   var value = Number(document.getElementById('steeringCorrection').value);
-  if(!Number.isInteger(value) || value < -90 || value > 90){
-    showNavigationNotice(
-      'Steering correction must be a whole number from -90 to 90 degrees per meter', true);
-    return;
-  }
   fetch('/api/v1/calibration/steering', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
@@ -729,10 +729,6 @@ function saveSteeringCorrection(){
 }
 function saveRotationCalibration(){
   var observed360 = Number(document.getElementById('rotation360Observed').value);
-  if(!Number.isInteger(observed360) || observed360 < 300 || observed360 > 420){
-    showNavigationNotice('Measured 360° turn must be a whole number from 300° to 420°', true);
-    return;
-  }
   fetch('/api/v1/calibration/rotation', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
@@ -752,7 +748,7 @@ function saveRotationCalibration(){
         response.data.calibration_equivalent_degrees +
         '° per commanded 360°';
       showNavigationNotice(
-        'Turn calibration refined from ' + response.data.observed_360_degrees +
+        'Turn calibration saved: ' + response.data.observed_360_degrees +
         '° measured; effective calibration is now ' +
         response.data.calibration_equivalent_degrees + '°');
     }).catch(function(error){

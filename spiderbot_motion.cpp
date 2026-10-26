@@ -225,26 +225,61 @@ void SpiderBotMotion::standby()
 
 void SpiderBotMotion::forward()
 {
-    Servo_PROGRAM_Run(Servo_Prg_2, Servo_Prg_2_Step);
-    if (isRobotStopRequested()) {
+    const int16_t correctionDegreesPerMeter = getForwardSteeringCorrection();
+    if (correctionDegreesPerMeter == 0) {
+        Servo_PROGRAM_Run(Servo_Prg_2, Servo_Prg_2_Step);
         return;
     }
 
-    const int correctionDegreesPerMeter = getForwardSteeringCorrection();
+    static const uint8_t rightSwingServos[] = {0, 3};
+    static const uint8_t leftSwingServos[] = {4, 7};
+    int steeringMatrix[Servo_Prg_2_Step][ALLMATRIX];
     const float correctionDegrees =
         fabsf((float)correctionDegreesPerMeter) *
         kForwardStepDistanceCm / 100.0f;
-    if (correctionDegrees < 0.01f) {
-        return;
+    const float correctionFraction = constrain(
+        correctionDegrees / (kFullTurnDegrees * getRotationCalibrationScale()),
+        0.0f, 0.5f);
+    const float leftStrideScale =
+        correctionDegreesPerMeter > 0
+            ? 1.0f + correctionFraction
+            : 1.0f - correctionFraction;
+    const float rightStrideScale =
+        correctionDegreesPerMeter > 0
+            ? 1.0f - correctionFraction
+            : 1.0f + correctionFraction;
+
+    for (int row = 0; row < Servo_Prg_2_Step; ++row) {
+        for (int column = 0; column < ALLMATRIX; ++column) {
+            steeringMatrix[row][column] = Servo_Prg_2[row][column];
+        }
+
+        for (size_t index = 0;
+             index < sizeof(rightSwingServos) / sizeof(rightSwingServos[0]);
+             ++index) {
+            const uint8_t servo = rightSwingServos[index];
+            const int baseline = Servo_Prg_2[0][servo];
+            steeringMatrix[row][servo] = constrain(
+                baseline + (int)lroundf(
+                    (Servo_Prg_2[row][servo] - baseline) *
+                    rightStrideScale),
+                PWMRES_Min, PWMRES_Max);
+        }
+
+        for (size_t index = 0;
+             index < sizeof(leftSwingServos) / sizeof(leftSwingServos[0]);
+             ++index) {
+            const uint8_t servo = leftSwingServos[index];
+            const int baseline = Servo_Prg_2[0][servo];
+            steeringMatrix[row][servo] = constrain(
+                baseline + (int)lroundf(
+                    (Servo_Prg_2[row][servo] - baseline) *
+                    leftStrideScale),
+                PWMRES_Min, PWMRES_Max);
+        }
     }
 
-    const float fraction =
-        correctionDegrees / (kFullTurnDegrees * getRotationCalibrationScale());
-    if (correctionDegreesPerMeter > 0) {
-        turnrightFraction(fraction);
-    } else {
-        turnleftFraction(fraction);
-    }
+    Servo_PROGRAM_Run(steeringMatrix, Servo_Prg_2_Step);
 }
 
 void SpiderBotMotion::backward()
@@ -267,47 +302,9 @@ void SpiderBotMotion::turnleft()
     Servo_PROGRAM_Run(Servo_Prg_6, Servo_Prg_6_Step);
 }
 
-void SpiderBotMotion::turnleftFraction(float fraction)
-{
-    if (fraction <= 0.0f || fraction > 1.0f) {
-        return;
-    }
-
-    int scaledMatrix[Servo_Prg_6_Step][ALLMATRIX];
-    for (int row = 0; row < Servo_Prg_6_Step; ++row) {
-        for (int column = 0; column < ALLMATRIX - 1; ++column) {
-            const int baseline = Servo_Prg_6[0][column];
-            const int target = Servo_Prg_6[row][column];
-            scaledMatrix[row][column] = baseline +
-                (int)lroundf((target - baseline) * fraction);
-        }
-        scaledMatrix[row][ALLMATRIX - 1] = Servo_Prg_6[row][ALLMATRIX - 1];
-    }
-    Servo_PROGRAM_Run(scaledMatrix, Servo_Prg_6_Step);
-}
-
 void SpiderBotMotion::turnright()
 {
     Servo_PROGRAM_Run(Servo_Prg_7, Servo_Prg_7_Step);
-}
-
-void SpiderBotMotion::turnrightFraction(float fraction)
-{
-    if (fraction <= 0.0f || fraction > 1.0f) {
-        return;
-    }
-
-    int scaledMatrix[Servo_Prg_7_Step][ALLMATRIX];
-    for (int row = 0; row < Servo_Prg_7_Step; ++row) {
-        for (int column = 0; column < ALLMATRIX - 1; ++column) {
-            const int baseline = Servo_Prg_7[0][column];
-            const int target = Servo_Prg_7[row][column];
-            scaledMatrix[row][column] = baseline +
-                (int)lroundf((target - baseline) * fraction);
-        }
-        scaledMatrix[row][ALLMATRIX - 1] = Servo_Prg_7[row][ALLMATRIX - 1];
-    }
-    Servo_PROGRAM_Run(scaledMatrix, Servo_Prg_7_Step);
 }
 
 void SpiderBotMotion::lie()

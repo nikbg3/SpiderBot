@@ -101,7 +101,11 @@ int8_t readKeyValue(int8_t key)
 static const int kForwardSteeringValueAddress = 8;
 static const int kForwardSteeringMarkerAddress = 9;
 static const uint8_t kForwardSteeringMarker = 0xA7;
-static const int8_t kDefaultForwardSteeringCorrection = 30;
+static const int kForwardSteeringHighByteAddress = 16;
+static const int kForwardSteeringV2MarkerAddress = 18;
+static const uint8_t kForwardSteeringV2Marker = 0xA8;
+static const int16_t kDefaultForwardSteeringCorrection = 30;
+static const int16_t kMaximumForwardSteeringCorrection = 360;
 static const int kRotation360ValueAddress = 12;
 static const int kRotationCalibrationMarkerAddress = 14;
 static const uint8_t kRotationCalibrationMarker = 0xD3;
@@ -109,9 +113,25 @@ static const int kRotationObservedValueAddress = 10;
 static const int kRotationObservedMarkerAddress = 15;
 static const uint8_t kRotationObservedMarker = 0xD4;
 static const uint16_t kDefaultObserved360Degrees = 360;
+static const uint16_t kMinimumObserved360Degrees = 45;
+static const uint16_t kMinimumRotationCalibrationDegrees = 45;
+static const float kCalibrationTurnGaitCommandDegrees = 18.70f;
 
-int8_t getForwardSteeringCorrection()
+static bool commitEepromWithRetry();
+
+int16_t getForwardSteeringCorrection()
 {
+    if (EEPROM.read(kForwardSteeringV2MarkerAddress) ==
+        kForwardSteeringV2Marker) {
+        const uint16_t rawCorrection =
+            (uint16_t)EEPROM.read(kForwardSteeringValueAddress) |
+            ((uint16_t)EEPROM.read(kForwardSteeringHighByteAddress) << 8);
+        const int16_t correction = (int16_t)rawCorrection;
+        return correction >= -kMaximumForwardSteeringCorrection &&
+            correction <= kMaximumForwardSteeringCorrection
+            ? correction : kDefaultForwardSteeringCorrection;
+    }
+
     if (EEPROM.read(kForwardSteeringMarkerAddress) != kForwardSteeringMarker) {
         return kDefaultForwardSteeringCorrection;
     }
@@ -123,12 +143,17 @@ int8_t getForwardSteeringCorrection()
 
 bool setForwardSteeringCorrection(int degreesPerMeter)
 {
-    if (degreesPerMeter < -90 || degreesPerMeter > 90) {
+    if (degreesPerMeter < -kMaximumForwardSteeringCorrection ||
+        degreesPerMeter > kMaximumForwardSteeringCorrection) {
         return false;
     }
-    EEPROM.write(kForwardSteeringValueAddress, (uint8_t)(int8_t)degreesPerMeter);
-    EEPROM.write(kForwardSteeringMarkerAddress, kForwardSteeringMarker);
-    return EEPROM.commit();
+    const uint16_t rawCorrection = (uint16_t)(int16_t)degreesPerMeter;
+    EEPROM.write(kForwardSteeringValueAddress, (uint8_t)rawCorrection);
+    EEPROM.write(kForwardSteeringHighByteAddress,
+        (uint8_t)(rawCorrection >> 8));
+    EEPROM.write(kForwardSteeringV2MarkerAddress,
+        kForwardSteeringV2Marker);
+    return commitEepromWithRetry();
 }
 
 static uint16_t readEepromUint16(int address)
@@ -143,6 +168,17 @@ static void writeEepromUint16(int address, uint16_t value)
     EEPROM.write(address + 1, (uint8_t)(value >> 8));
 }
 
+static bool commitEepromWithRetry()
+{
+    for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+        if (EEPROM.commit()) {
+            return true;
+        }
+        delay(10);
+    }
+    return false;
+}
+
 uint16_t getObserved360RotationDegrees()
 {
     if (EEPROM.read(kRotationObservedMarkerAddress) !=
@@ -150,7 +186,7 @@ uint16_t getObserved360RotationDegrees()
         return kDefaultObserved360Degrees;
     }
     const uint16_t value = readEepromUint16(kRotationObservedValueAddress);
-    return value >= 300 && value <= 420
+    return value >= kMinimumObserved360Degrees
         ? value : kDefaultObserved360Degrees;
 }
 
@@ -161,7 +197,7 @@ uint16_t getRotationCalibrationEquivalentDegrees()
         return kDefaultObserved360Degrees;
     }
     const uint16_t value = readEepromUint16(kRotation360ValueAddress);
-    return value >= 250 && value <= 490
+    return value >= kMinimumRotationCalibrationDegrees
         ? value : kDefaultObserved360Degrees;
 }
 
@@ -172,22 +208,30 @@ float getRotationCalibrationScale()
 
 bool setObserved360RotationDegrees(uint16_t observed360)
 {
-    if (observed360 < 300 || observed360 > 420) {
+    if (observed360 < kMinimumObserved360Degrees) {
         return false;
     }
     const uint16_t currentEquivalent =
         getRotationCalibrationEquivalentDegrees();
-    const uint16_t updatedEquivalent = (uint16_t)lroundf(
-        (float)currentEquivalent * observed360 / 360.0f);
-    if (updatedEquivalent < 250 || updatedEquivalent > 490) {
-        return false;
+    const float currentScale = (float)currentEquivalent / 360.0f;
+    const uint16_t gaitCount = (uint16_t)ceilf(
+        (360.0f / currentScale) / kCalibrationTurnGaitCommandDegrees);
+    const float nominalGaitCommandDegrees =
+        gaitCount * kCalibrationTurnGaitCommandDegrees;
+    long updatedEquivalent = lround(
+        (double)observed360 * 360.0 / nominalGaitCommandDegrees);
+    if (updatedEquivalent < kMinimumRotationCalibrationDegrees) {
+        updatedEquivalent = kMinimumRotationCalibrationDegrees;
+    } else if (updatedEquivalent > UINT16_MAX) {
+        updatedEquivalent = UINT16_MAX;
     }
-    writeEepromUint16(kRotation360ValueAddress, updatedEquivalent);
+    writeEepromUint16(kRotation360ValueAddress,
+        (uint16_t)updatedEquivalent);
     EEPROM.write(kRotationCalibrationMarkerAddress,
         kRotationCalibrationMarker);
     writeEepromUint16(kRotationObservedValueAddress, observed360);
     EEPROM.write(kRotationObservedMarkerAddress, kRotationObservedMarker);
-    return EEPROM.commit();
+    return commitEepromWithRetry();
 }
 
 const RobotActionInfo* getRobotActions(size_t& count)
@@ -345,14 +389,18 @@ bool queueNavigationTarget(NavigationTargetKind kind,
                 g_navigationTelemetry.mapOffsetX;
             const float localY = -waypoints[i].yCm / 10.0f -
                 g_navigationTelemetry.mapOffsetY;
-            if (localX < 0.0f || localX >= 31.0f ||
-                localY < 0.0f || localY >= 31.0f) {
+            if (localX < 0.0f ||
+                localX >= NAVIGATION_MAP_MAX_WIDTH ||
+                localY < 0.0f ||
+                localY >= NAVIGATION_MAP_MAX_WIDTH) {
                 return false;
             }
             const int cellX = (int)lroundf(localX);
             const int cellY = (int)lroundf(localY);
-            if (cellX >= 31 || cellY >= 31 ||
-                g_navigationTelemetry.occupancyGrid[cellY * 31 + cellX] == 2) {
+            if (cellX >= NAVIGATION_MAP_MAX_WIDTH ||
+                cellY >= NAVIGATION_MAP_MAX_WIDTH ||
+                g_navigationTelemetry.occupancyGrid[
+                    cellY * NAVIGATION_MAP_MAX_WIDTH + cellX] == 2) {
                 return false;
             }
         }
@@ -388,7 +436,8 @@ void publishNavigationTelemetry(const char* state, const char* reason,
     float headingDegrees,
     int mapOffsetX, int mapOffsetY, int recoveryAttempts, bool sensorValid,
     const uint16_t scanDistancesCm[12],
-    const uint8_t occupancyGrid[31 * 31])
+    const uint8_t occupancyGrid[
+        NAVIGATION_MAP_MAX_WIDTH * NAVIGATION_MAP_MAX_WIDTH])
 {
     strncpy(g_navigationTelemetry.state, state, sizeof(g_navigationTelemetry.state) - 1);
     g_navigationTelemetry.state[sizeof(g_navigationTelemetry.state) - 1] = '\0';
@@ -697,8 +746,17 @@ static bool resolveStopMode(int& targetProgram)
 
 // ── WiFi / EEPROM init ────────────────────────────────────────────────────────
 
+void beginWebStorage()
+{
+    EEPROM.begin(512);
+    delay(10);
+}
+
 bool webinit()
 {
+    WiFi.mode(WIFI_AP);
+    delay(100);
+
     uint8_t mac[WL_MAC_ADDR_LENGTH];
     WiFi.softAPmacAddress(mac);
     String macID = String(mac[WL_MAC_ADDR_LENGTH - 2], HEX) + String(mac[WL_MAC_ADDR_LENGTH - 1], HEX);
@@ -706,16 +764,23 @@ bool webinit()
 
     String AP_NameString = "Robot - " + macID;
     g_deviceName = AP_NameString;
-    char AP_NameChar[AP_NameString.length() + 1];
-    memset(AP_NameChar, 0, AP_NameString.length() + 1);
-    for (int i = 0; i < (int)AP_NameString.length(); i++)
-        AP_NameChar[i] = AP_NameString.charAt(i);
+    char AP_NameChar[32] = {0};
+    AP_NameString.toCharArray(AP_NameChar, sizeof(AP_NameChar));
 
-    WiFi.mode(WIFI_AP);
-    g_wifiApReady = WiFi.softAP(AP_NameChar, password);
+    for (uint8_t attempt = 0; attempt < 3 && !g_wifiApReady; ++attempt) {
+        g_wifiApReady = WiFi.softAP(AP_NameChar, password);
+        if (!g_wifiApReady) {
+            WiFi.softAPdisconnect(true);
+            WiFi.mode(WIFI_AP);
+            delay(250);
+        }
+    }
 
-    EEPROM.begin(512);
-    delay(10);
+    return g_wifiApReady;
+}
+
+bool isWifiApReady()
+{
     return g_wifiApReady;
 }
 
@@ -810,7 +875,8 @@ static void handleApiState()
 static void handleApiNavigation()
 {
     String data;
-    data.reserve(1600);
+    data.reserve(
+        NAVIGATION_MAP_MAX_WIDTH * NAVIGATION_MAP_MAX_WIDTH + 1024);
     data = "{";
     data += "\"state\":\"";
     data += g_navigationTelemetry.state;
@@ -826,10 +892,6 @@ static void handleApiNavigation()
     data += String(g_navigationTelemetry.areaCoveredM2, 2);
     data += ",\"heading_deg\":";
     data += String(g_navigationTelemetry.headingDegrees, 2);
-    data += ",\"map_offset_x\":";
-    data += String(g_navigationTelemetry.mapOffsetX);
-    data += ",\"map_offset_y\":";
-    data += String(g_navigationTelemetry.mapOffsetY);
     data += ",\"recovery_attempts\":";
     data += String(g_navigationTelemetry.recoveryAttempts);
     data += ",\"scan_cm\":[";
@@ -839,11 +901,65 @@ static void handleApiNavigation()
         }
         data += String(g_navigationTelemetry.scanDistancesCm[i]);
     }
-    data += "],\"map_width\":31,\"map_height\":31,\"cell_size_cm\":10,\"grid\":\"";
+    int minX = NAVIGATION_MAP_MAX_WIDTH;
+    int minY = NAVIGATION_MAP_MAX_WIDTH;
+    int maxX = -1;
+    int maxY = -1;
+    for (int y = 0; y < NAVIGATION_MAP_MAX_WIDTH; ++y) {
+        for (int x = 0; x < NAVIGATION_MAP_MAX_WIDTH; ++x) {
+            if (g_navigationTelemetry.occupancyGrid[
+                    y * NAVIGATION_MAP_MAX_WIDTH + x] == 0) {
+                continue;
+            }
+            minX = min(minX, x);
+            minY = min(minY, y);
+            maxX = max(maxX, x);
+            maxY = max(maxY, y);
+        }
+    }
+
+    const int homeX = -g_navigationTelemetry.mapOffsetX;
+    const int homeY = -g_navigationTelemetry.mapOffsetY;
+    if (homeX >= 0 && homeX < NAVIGATION_MAP_MAX_WIDTH &&
+        homeY >= 0 && homeY < NAVIGATION_MAP_MAX_WIDTH) {
+        minX = min(minX, homeX);
+        minY = min(minY, homeY);
+        maxX = max(maxX, homeX);
+        maxY = max(maxY, homeY);
+    }
+    if (maxX < 0 || maxY < 0) {
+        minX = minY = maxX = maxY = NAVIGATION_MAP_MAX_WIDTH / 2;
+    }
+
+    minX = max(0, minX - 2);
+    minY = max(0, minY - 2);
+    maxX = min((int)NAVIGATION_MAP_MAX_WIDTH - 1, maxX + 2);
+    maxY = min((int)NAVIGATION_MAP_MAX_WIDTH - 1, maxY + 2);
+    const int mapWidth = max(15, max(maxX - minX + 1, maxY - minY + 1));
+    const int mapLeft = constrain(
+        (minX + maxX - mapWidth + 1) / 2,
+        0, (int)NAVIGATION_MAP_MAX_WIDTH - mapWidth);
+    const int mapTop = constrain(
+        (minY + maxY - mapWidth + 1) / 2,
+        0, (int)NAVIGATION_MAP_MAX_WIDTH - mapWidth);
+
+    data += "],\"map_width\":";
+    data += String(mapWidth);
+    data += ",\"map_height\":";
+    data += String(mapWidth);
+    data += ",\"cell_size_cm\":10,\"map_offset_x\":";
+    data += String(g_navigationTelemetry.mapOffsetX + mapLeft);
+    data += ",\"map_offset_y\":";
+    data += String(g_navigationTelemetry.mapOffsetY + mapTop);
+    data += ",\"grid\":\"";
     static const char kMapCellSymbols[] = {'?', '.', '#', '+', 'R'};
-    for (size_t i = 0; i < sizeof(g_navigationTelemetry.occupancyGrid); ++i) {
-        const uint8_t cell = g_navigationTelemetry.occupancyGrid[i];
-        data += cell < sizeof(kMapCellSymbols) ? kMapCellSymbols[cell] : '?';
+    for (int y = mapTop; y < mapTop + mapWidth; ++y) {
+        for (int x = mapLeft; x < mapLeft + mapWidth; ++x) {
+            const uint8_t cell = g_navigationTelemetry.occupancyGrid[
+                y * NAVIGATION_MAP_MAX_WIDTH + x];
+            data += cell < sizeof(kMapCellSymbols)
+                ? kMapCellSymbols[cell] : '?';
+        }
     }
     data += "\"}";
     sendJsonResponse(200, true, 0, "OK", data);
@@ -1074,9 +1190,10 @@ static void handleApiSteeringCalibrationPost()
 {
     int degreesPerMeter = 0;
     if (!parseSteeringCalibrationValue(degreesPerMeter) ||
-        degreesPerMeter < -90 || degreesPerMeter > 90) {
+        degreesPerMeter < -kMaximumForwardSteeringCorrection ||
+        degreesPerMeter > kMaximumForwardSteeringCorrection) {
         sendJsonError(400, 4005,
-            "degrees_per_meter must be a whole number from -90 to 90");
+            "degrees_per_meter must be a whole number from -360 to 360");
         return;
     }
     if (!setForwardSteeringCorrection(degreesPerMeter)) {
@@ -1106,13 +1223,15 @@ static void handleApiRotationCalibrationPost()
     int observed360 = 0;
     if (!isJsonIntegerProperty(body, "observed_360_degrees") ||
         !extractJsonInt(body, "observed_360_degrees", observed360) ||
-        observed360 < 300 || observed360 > 420) {
+        observed360 < kMinimumObserved360Degrees ||
+        observed360 > UINT16_MAX) {
         sendJsonError(400, 4006,
-            "observed_360_degrees must be a whole number from 300 to 420");
+            "observed_360_degrees must be a whole number from 45 to 65535");
         return;
     }
     if (!setObserved360RotationDegrees((uint16_t)observed360)) {
-        sendJsonError(500, 5006, "could not persist turn calibration");
+        sendJsonError(500, 5006,
+            "EEPROM flash write failed; turn calibration was not saved");
         return;
     }
 

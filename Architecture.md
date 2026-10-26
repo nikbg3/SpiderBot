@@ -117,7 +117,7 @@ constraints; attached peripherals must not force them into invalid boot levels.
 | File | Responsibility |
 |---|---|
 | [`SpiderBot.ino`](./SpiderBot.ino) | Firmware entry points, infrared command dispatch, ultrasonic measurement, navigation state machine, target handling, pose/map estimates, and navigation telemetry publication. |
-| [`spiderbot_motion.h`](./spiderbot_motion.h) | `SpiderBotMotion` interface for servo setup, gaits, fractional turns, and poses. |
+| [`spiderbot_motion.h`](./spiderbot_motion.h) | `SpiderBotMotion` interface for servo setup, full turn gaits, and poses. |
 | [`spiderbot_motion.cpp`](./spiderbot_motion.cpp) | Servo initialization and pin mapping, EEPROM servo offsets, keyframe interpolation, forward steering correction, and motion implementations. |
 | [`actionarray.h`](./actionarray.h) | Servo poses and gait keyframe matrices, including forward/backward walking, shifts, turns, and animations. |
 | [`webserver.h`](./webserver.h) | Shared action IDs, navigation/API structures, telemetry shape, and cross-module function declarations. |
@@ -131,13 +131,13 @@ constraints; attached peripherals must not force them into invalid boot levels.
 
 1. Enables optional debug serial output and starts the IR receiver.
 2. Configures the ultrasonic trigger and echo pins.
-3. Starts the Wi-Fi access point and HTTP server.
-4. Initializes all eight servo channels and moves them to the configured zero
-   pose.
+3. Initializes EEPROM-backed calibration storage, attaches the servo channels,
+   and moves them to the configured zero pose.
+4. Starts the Wi-Fi access point and HTTP server.
 5. Takes an ultrasonic reading and retries sensor recovery if necessary.
-6. On successful Wi-Fi and sensor startup, enters a five-second
-   `STARTUP_DELAY`; otherwise autonomous navigation is disabled and the
-   navigation state reports an error.
+6. If the AP fails, the main loop retries it every ten seconds. Sensor-valid
+   navigation can still start after the five-second `STARTUP_DELAY`, so an AP
+   startup failure does not prevent servo movement.
 
 The AP name includes the last two bytes of the ESP's MAC address. The AP
 credential is configured in firmware. The dashboard and API are served
@@ -182,10 +182,12 @@ sequence of eight servo targets plus a duration. The motion layer interpolates
 from the cached servo positions toward each keyframe, applies per-servo
 EEPROM offsets, and services the HTTP client while animating.
 
-The forward gait represents an estimated 8 cm step. A completed forward gait
-may be followed by a fractional turn gait when forward steering correction is
-non-zero. Fractional turn methods scale the turn keyframe amplitudes from the
-turn gait's baseline pose; they do not measure actual angle.
+The forward gait represents an estimated 8 cm step. When forward steering
+correction is non-zero, the motion layer scales the left and right foot-swing
+keyframe excursions in opposite directions during the forward gait. Positive
+values increase left-side stride and reduce right-side stride to counter left
+drift; negative values reverse that bias. The adjustment is open-loop and does
+not measure actual heading or drift.
 
 ## 5. Autonomous navigation
 
@@ -197,12 +199,12 @@ turn gait's baseline pose; they do not measure actual angle.
 | `STARTUP_DELAY` | Wait before enabling autonomous behavior. |
 | `INITIAL_SCANNING` | Rotate in calibrated steps, sample range, and build initial map data. |
 | `EXPLORING` | Check forward range and walk forward when clear. |
-| `AVOIDING_OBSTACLE` | Scan around an obstacle and select an open direction. |
+| `AVOIDING_OBSTACLE` | Scan around an obstacle, then shift in the established sweep direction. |
 | `REPOSITIONING` | Shift into the next coverage lane. |
 | `RECOVERING` | Retry a blocked route or invalid sensor readings. |
 | `TARGETING` | Move toward the active waypoint, route point, or home. |
 | `PAUSED` | Hold navigation until the operator resumes or restarts. |
-| `STOPPED` | Stop after recovery limits are exhausted. |
+| `STOPPED` | Stop when the adjacent sweep lane is blocked or recovery limits are exhausted. |
 | `ERROR` | Report a startup, sensor, or navigation failure. |
 
 ### 5.2 Coverage and obstacle handling
@@ -214,17 +216,36 @@ The default coverage parameters are:
 | Forward step distance used for estimates | 8 cm |
 | Nominal turn gait angle | 18.70° |
 | Safe-turn distance | 30 cm |
-| Forward steps per coverage lane | 12 |
-| Lane spacing | 2 forward gait steps |
+| Initial and obstacle scan gait | Full turn gait |
+| Lane spacing | 1 forward gait step (8 cm) |
 | Blocked cycles before recovery | 5 |
 | Maximum recovery attempts | 3 |
 | Invalid sensor cycles before recovery | 5 |
 
-When exploring, the controller reads the ultrasonic sensor. A valid range below
-the safe-turn distance is treated as an obstacle. The robot centers, performs a
-360° scan, compares scan samples from both sides, and attempts to change lanes.
-If obstruction persists, recovery is attempted; after the configured limit,
-navigation stops.
+After a calibrated 360° scan, the robot follows a serpentine sweep. It walks a
+lane until the front range detects the room boundary or another obstacle, turns
+and shifts one 8 cm step into the next lane, then reverses direction. It no
+longer stops a lane at an arbitrary 12-step limit. If the next lane shift in
+the sweep direction is blocked, it restores its original heading and stops
+instead of repeatedly turning from a partial pose.
+
+The initial scan compares average left/right ranges to choose a sweep direction;
+later obstacle scans preserve that direction to keep the zig-zag consistent.
+Initial mapping and obstacle scans use only complete turn gaits, sampling once
+per gait. The map heading advances by the calibrated estimate for each complete
+gait, including when the requested total rotation ends partway through a gait.
+Each valid range maps the measured endpoint as an obstacle and marks the
+intervening sonar beam as observed clear, using a nominal 7.5° half-angle.
+Unobserved cells remain unknown; a missing echo is treated as an invalid sensor
+reading rather than assumed to mean open space. If obstruction persists,
+recovery is attempted; after the configured limit, navigation stops.
+
+The firmware stores a 61 × 61 grid at 10 cm per cell. The API crops the map to
+the observed bounds with padding and publishes a dynamic square dimension, so
+the mini-map grows as exploration reveals more of the room (up to the grid
+capacity). The fixed-size backing grid is recentered as the estimated robot
+position approaches its edge; cells beyond capacity may eventually leave the
+map.
 
 An invalid or timed-out ultrasonic reading is treated as unavailable, not as a
 clear path. Recovery retries the sensor while the robot is stationary. If
@@ -242,12 +263,11 @@ flowchart TD
     RecoverSensor -->|Recovered| Explore
     RecoverSensor -->|Failed| Error
     Range -->|Clear| Step[Forward gait and update estimated map position]
-    Step --> Lane{Coverage lane complete?}
-    Lane -->|Yes| Shift[Shift to next lane]
-    Shift --> Explore
-    Lane -->|No| Explore
-    Range -->|Obstacle| Avoid[Scan and choose open direction]
-    Avoid -->|Path found| Shift
+    Step --> Explore
+    Range -->|Obstacle| Avoid[Scan and keep sweep direction]
+    Avoid --> Shift[Turn and shift one step]
+    Shift -->|Shift clear| Explore
+    Shift -->|Shift blocked| Stopped[Coverage boundary reached]
     Avoid -->|Repeated blockage| Recover[Recovery scan / lane change]
     Recover -->|Attempts remain| Explore
     Recover -->|Limit reached| Stopped[STOPPED]
@@ -255,7 +275,9 @@ flowchart TD
 
 The 360° scan is resumable when interrupted by a navigation command: its
 remaining turn steps are retained in RAM. Each scan step samples the current
-heading and distance before turning.
+heading and distance before turning. Coverage remains estimate-driven: without
+an IMU/encoder or a known room boundary, gait drift and irregular obstacles
+prevent a mathematical guarantee that every floor point was crossed.
 
 ### 5.3 Waypoints, routes, and return home
 
@@ -280,17 +302,19 @@ represented as a target at world coordinate `(0, 0)`.
 Explicit rotations from manual control and navigation use `rotateByDegrees()`.
 It reads one persistent 360° calibration scale, converts the requested
 physical angle into a command angle, then splits the result into nominal
-18.70° gait units plus a fractional final gait. Full-circle scans use the
-same calibration scale and `performTurnStep()` directly. The software updates
-estimated heading using the scale. Forward steering correction is a separate
-persistent value in degrees per meter; it applies a small opposite fractional
-turn gait after each forward gait.
+18.70° gait units. All turns use complete gait units, and map heading updates
+use the full estimated angle of each gait. Scans use the same calibration
+scale. Forward steering correction
+is a separate persistent value in degrees per meter; it biases left and right
+foot-swing stride during the forward gait.
 
 Both calibrations rely on gait-based estimates:
 
 - The turn calibration is based on a measured 360° result and assumes that the
   correction scales linearly to smaller turns and behaves similarly in both
-  directions.
+  directions. Its update accounts for the number of complete gait steps used
+  by the current calibration, including the overshoot caused by the final
+  full-step gait.
 - The forward correction assumes a degrees-per-meter effect and applies it
   after each 8 cm forward gait.
 
@@ -300,10 +324,13 @@ can cause actual movement to differ from the displayed estimate.
 
 ## 6. Mapping and telemetry
 
-The navigation module maintains a **31 × 31** occupancy grid with a nominal
-10 cm cell size. It starts with the robot at the grid origin. Range samples
-mark intermediate cells as observed clear and the measured endpoint as an
-obstacle; completed gaits mark the estimated path and robot position.
+The navigation module maintains a **61 × 61** maximum occupancy grid with a
+nominal 10 cm cell size (up to 6.1 m square). It starts with the robot at the
+grid origin. Range samples mark the sonar beam as observed clear and the
+measured endpoint as an obstacle; completed gaits mark the estimated path and
+robot position. The API crops the grid to the observed area plus a small
+unknown border, so the mini-map starts compact and gains cells as the robot
+discovers a larger room, up to the firmware grid limit.
 
 | Grid value | API symbol | Meaning |
 |---|---|---|
@@ -391,7 +418,7 @@ the HTTP handler. Manual actions use the `Servo_PROGRAM` request slot.
 | Setting/state | Storage | Persistence |
 |---|---|---|
 | Eight servo offsets | EEPROM bytes 0–7 | Persistent across reboot. |
-| Forward steering correction | EEPROM byte 8 plus marker byte 9 | Persistent across reboot. |
+| Forward steering correction | Signed 16-bit value in EEPROM bytes 8 and 16, with version marker byte 18 | Persistent across reboot; legacy byte 8 / marker byte 9 values are still read until a new value is saved. |
 | Last measured 360° angle | EEPROM bytes 10–11 plus marker byte 15 | Persistent across reboot. |
 | Effective turn-calibration equivalent | EEPROM bytes 12–13 plus marker byte 14 | Persistent across reboot. |
 | Occupancy map, pose, scan progress, and active route | RAM globals | Reset on device restart. |

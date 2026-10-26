@@ -4,6 +4,8 @@
 #include <ESP8266WebServer.h>
 #include "spiderbot_motion.h"
 
+static const uint8_t NAVIGATION_MAP_MAX_WIDTH = 61;
+
 enum RobotProgramId {
     PROGRAM_NONE = 0,
     PROGRAM_STANDBY = 1,
@@ -50,7 +52,8 @@ struct NavigationTelemetry {
     int recoveryAttempts;
     bool sensorValid;
     uint16_t scanDistancesCm[12];
-    uint8_t occupancyGrid[31 * 31];
+    uint8_t occupancyGrid[
+        NAVIGATION_MAP_MAX_WIDTH * NAVIGATION_MAP_MAX_WIDTH];
 };
 
 enum NavigationControl {
@@ -80,13 +83,15 @@ extern int GPIO_ID;
 extern String ival;
 extern const RobotDeviceInfo kRobotDeviceInfo;
 
+void beginWebStorage();
 bool webinit();
+bool isWifiApReady();
 void enableWebServer();
 void handleClient();
 
 void writeKeyValue(int8_t key, int8_t value);
 int8_t readKeyValue(int8_t key);
-int8_t getForwardSteeringCorrection();
+int16_t getForwardSteeringCorrection();
 bool setForwardSteeringCorrection(int degreesPerMeter);
 uint16_t getObserved360RotationDegrees();
 uint16_t getRotationCalibrationEquivalentDegrees();
@@ -120,6 +125,7 @@ void publishNavigationTelemetry(const char* state, const char* reason,
     float distanceTravelledCm, float areaCoveredM2, float headingDegrees,
     int mapOffsetX, int mapOffsetY, int recoveryAttempts,
     bool sensorValid, const uint16_t scanDistancesCm[12],
-    const uint8_t occupancyGrid[31 * 31]);
+    const uint8_t occupancyGrid[
+        NAVIGATION_MAP_MAX_WIDTH * NAVIGATION_MAP_MAX_WIDTH]);
 
 #endif
